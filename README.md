@@ -1,15 +1,15 @@
 # SSH Mic Bridge
 
-### Talk to Claude Code on your server. Over SSH. Finally.
+### Talk to CLI Agents on your server. Over SSH. Finally.
 
 > **A local microphone:** voice dictation does not work in cloud sessions or
 > SSH sessions.
 >
 > — [Claude Code docs, Voice dictation](https://code.claude.com/docs/en/voice-dictation#requirements)
 
-Claude Code's `/voice` is great, until your Claude lives on a server. It
-records the machine Claude runs on, and a headless box in a closet has no
-microphone. So you've been typing.
+`/voice` is great, until your agent lives on a server. The agent has no access
+to your microphone, so unless you are opening your phone to dictate
+instructions, you've been typing.
 
 **With SSH Mic Bridge, "voice mode doesn't work over SSH" is a thing of the
 past.** Press SUPER + ALT + V, run `/voice` in your SSH session, and talk.
