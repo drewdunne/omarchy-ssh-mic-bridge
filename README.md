@@ -57,6 +57,14 @@ omarchy plugin add https://github.com/drewdunne/omarchy-ssh-mic-bridge.git --yes
 Then: SUPER + ALT + V, `ssh you@server`, `claude`, `/voice tap`, and start
 talking.
 
+## Works with
+
+- **AirPods:** plug and play with the
+  [AirPods plugin](https://github.com/thisisgm/omarchy-pods). Use your AirPods
+  as the mic and dictate over SSH, no extra setup.
+- **Tested on:** developed on a desktop workstation, then ported to and tested
+  on a Dell DS14265.
+
 ## What you get
 
 | Where | What |
