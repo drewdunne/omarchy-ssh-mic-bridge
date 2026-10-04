@@ -73,7 +73,9 @@ tooltip names the mic and the server.
 ## Requirements
 
 - **This machine:** Omarchy 4 (Hyprland 0.56+ with Lua config, PipeWire), and
-  SSH access to the server.
+  SSH access to the server. It uses `parec`, `pacat` and `pactl` (libpulse),
+  `notify-send`, `ssh`, `systemd-run`, `xdg-terminal-exec`, `jq` and `python3`.
+  Omarchy ships all of them; `setup install` names any that are missing.
 - **Server:** Linux with a systemd user session, `python3`, and PipeWire with
   `pipewire-pulse` and `pipewire-alsa`. Plain PulseAudio with its ALSA plugin
   works too. No GUI, no sound card and no open ports are needed. The ALSA part
