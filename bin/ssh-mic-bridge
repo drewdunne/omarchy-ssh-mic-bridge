@@ -1,0 +1,414 @@
+#!/bin/bash
+
+# Stream this machine's microphone over SSH into a virtual mic on a server, so
+# apps there that record the default mic (like Claude Code's /voice) hear you.
+#
+# start [mic]   start streaming (default: the configured mic)
+# stop          stop streaming
+# toggle        start if stopped, stop if running
+# pick          choose a microphone from a menu, then stream from it
+# mics          list microphones as "name<TAB>description"
+# mic [name]    print the mic setting, or set it (checked against your mics)
+# which [mic]   print the source a mic name streams from
+# host [h]      print the server, or set it to user@host
+# test          record what reaches the server and play it back
+# status        show the state as a notification
+# state         print the state as one line of JSON (for the bar widget)
+# running       exit 0 if streaming
+# log           show this boot's log
+# stream [mic]  stream in the foreground (what the background unit runs)
+#
+# A mic is "default" (the system default input), an exact source name from
+# `ssh-mic-bridge mics`, or any part of a microphone's name, like "Yeti".
+#
+# Settings live in ~/.config/ssh-mic-bridge/config, or the environment:
+#   SSH_MIC_BRIDGE_HOST  the server, as user@host (required)
+#   SSH_MIC_BRIDGE_MIC   the mic to stream (default: default)
+
+set -uo pipefail
+
+ID=gg.arkship.ssh-mic-bridge
+UNIT=ssh-mic-bridge.service
+CLIENT=ssh-mic-bridge
+SELF=$(readlink -f "$0")
+CONFIG=${XDG_CONFIG_HOME:-$HOME/.config}/ssh-mic-bridge/config
+RUNTIME=${XDG_RUNTIME_DIR:-/tmp}
+LABEL_FILE=$RUNTIME/ssh-mic-bridge.mic
+LOCK=$RUNTIME/ssh-mic-bridge.lock
+
+# The contract with the server: raw s16le, 48 kHz, mono into the "vmic" sink.
+FORMAT=(--format=s16le --rate=48000 --channels=1)
+SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=3)
+
+[[ -f $CONFIG ]] && source "$CONFIG"
+HOST=${SSH_MIC_BRIDGE_HOST:-}
+MIC=${SSH_MIC_BRIDGE_MIC:-default}
+
+note() {
+  notify-send -u "${2:-low}" "SSH Mic Bridge" "$1"
+}
+
+fail() {
+  note "$1" critical
+  echo "ssh-mic-bridge: $1" >&2
+  exit 1
+}
+
+refresh_bar() {
+  omarchy-shell -q "$ID" refresh >/dev/null 2>&1 || true
+}
+
+require_host() {
+  [[ -n $HOST ]] || fail "No server set. Run: ~/.config/omarchy/plugins/$ID/setup server"
+}
+
+server_name() {
+  local host=${HOST#*@}
+  echo "${host:-no server}"
+}
+
+# ------------------------------------------------------------------ settings
+
+# set_config KEY VALUE: replace or add KEY in the config file.
+set_config() {
+  local line
+  line="$1=$(printf '%q' "$2")"
+  mkdir -p "$(dirname "$CONFIG")"
+  touch "$CONFIG"
+  KEY="$1" LINE="$line" awk '
+    index($0, ENVIRON["KEY"] "=") == 1 { print ENVIRON["LINE"]; done = 1; next }
+    { print }
+    END { if (!done) print ENVIRON["LINE"] }
+  ' "$CONFIG" >"$CONFIG.tmp" && mv "$CONFIG.tmp" "$CONFIG"
+}
+
+# ------------------------------------------------------------------ mics
+
+# Every input as "name<TAB>description"; monitors of outputs are left out.
+mics() {
+  pactl -f json list sources 2>/dev/null |
+    jq -r '.[] | select(.name | endswith(".monitor") | not) | [.name, .description] | @tsv'
+}
+
+describe() {
+  mics | awk -F '\t' -v n="$1" '$1 == n { print $2; exit }'
+}
+
+# Print the source for a mic; empty means the system default input.
+# Matching order: "default", an exact source name, an exact description,
+# then one source whose name or description contains it (ignoring case).
+resolve_mic() {
+  local want=$1 all matches count
+  [[ -z $want || $want == default ]] && return 0
+
+  all=$(mics)
+  matches=$(awk -F '\t' -v w="$want" '$1 == w { print $1; exit }' <<<"$all")
+  [[ -n $matches ]] || matches=$(awk -F '\t' -v w="${want,,}" 'tolower($2) == w { print $1 }' <<<"$all")
+  [[ -n $matches ]] || matches=$(awk -F '\t' -v w="${want,,}" 'index(tolower($1 "\t" $2), w) { print $1 }' <<<"$all")
+
+  count=$(grep -c . <<<"$matches")
+  if ((count == 1)); then
+    echo "$matches"
+    return 0
+  fi
+
+  if ((count == 0)); then
+    echo "No microphone matches '$want'. Is it plugged in?" >&2
+  else
+    local names=() list
+    while read -r m; do names+=("$(describe "$m")"); done <<<"$matches"
+    printf -v list '%s, ' "${names[@]}"
+    echo "'$want' matches $count microphones (${list%, }). Be more specific." >&2
+  fi
+  return 1
+}
+
+# A mic's description, like "Yeti Stereo Microphone"; empty means the
+# current default input.
+mic_label() {
+  local name=$1 desc
+  [[ -n $name ]] || name=$(pactl get-default-source 2>/dev/null)
+  desc=$(describe "$name")
+  echo "${desc:-${name:-default input}}"
+}
+
+# ------------------------------------------------------------------ state
+
+unit_state() {
+  systemctl --user is-active "$UNIT" 2>/dev/null
+}
+
+is_running() {
+  case $(unit_state) in
+    active | activating) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Our capture stream has its own client name, which also gives it its own
+# entry in WirePlumber's stream-restore (a stored mute for a shared name like
+# "parec" once silenced every stream while level meters still moved).
+stream_up() {
+  pactl list source-outputs 2>/dev/null | grep -q "application.name = \"$CLIENT\""
+}
+
+running_label() {
+  cat "$LABEL_FILE" 2>/dev/null || echo "?"
+}
+
+# ------------------------------------------------------------------ ssh
+
+# The stream runs in the background with BatchMode, so SSH must work without
+# a prompt. With a passphrase key and an empty agent (after a reboot), open a
+# terminal to unlock it: ssh asks for whichever key the host needs, and
+# AddKeysToAgent keeps it for the background stream.
+ensure_ssh() {
+  ssh -o BatchMode=yes -o ConnectTimeout=5 "$HOST" true >/dev/null 2>&1 && return 0
+
+  ssh-add -l >/dev/null 2>&1
+  if (($? == 2)); then
+    note "Can't reach $HOST without a password prompt, and there is no SSH agent to unlock a key in. Check: ssh $HOST" critical
+    return 1
+  fi
+
+  note "Unlock your SSH key to start streaming" normal
+  setsid xdg-terminal-exec --app-id=org.omarchy.terminal --title="SSH Mic Bridge: unlock SSH key" \
+    -e ssh -o AddKeysToAgent=yes "$HOST" true >/dev/null 2>&1 </dev/null &
+  for _ in {1..60}; do
+    sleep 2
+    ssh -o BatchMode=yes -o ConnectTimeout=5 "$HOST" true >/dev/null 2>&1 && return 0
+  done
+  note "Still can't reach $HOST over SSH, so streaming did not start" critical
+  return 1
+}
+
+# ------------------------------------------------------------------ commands
+
+stream() {
+  local src
+  require_host
+  src=$(resolve_mic "${1:-$MIC}") || exit 1
+  command -v parec >/dev/null || { echo "ssh-mic-bridge: parec not found (install libpulse)" >&2; exit 1; }
+
+  # Make sure the server's virtual mic exists and is live.
+  ssh "${SSH_OPTS[@]}" "$HOST" '
+    systemctl --user start vmic-keepalive 2>/dev/null || true
+    pactl list short sources | grep -qw vmic_mic || systemctl --user restart vmic-keepalive
+    pactl list short sources | grep -qw vmic_mic
+  ' >/dev/null || {
+    echo "ssh-mic-bridge: no virtual mic on $HOST. Run: ~/.config/omarchy/plugins/$ID/setup server" >&2
+    exit 1
+  }
+
+  echo "ssh-mic-bridge: $(mic_label "$src") -> $HOST vmic" >&2
+
+  # Undo a stored or accidental mute of our capture stream once it exists.
+  (
+    sleep 2
+    pactl list source-outputs 2>/dev/null |
+      awk -v c="$CLIENT" '/^Source Output #/ { id = substr($3, 2) } index($0, "application.name = \"" c "\"") { print id }' |
+      while read -r id; do
+        pactl set-source-output-mute "$id" 0 2>/dev/null || true
+        pactl set-source-output-volume "$id" 100% 2>/dev/null || true
+      done
+  ) &
+
+  parec "${FORMAT[@]}" --latency-msec=30 ${src:+--device="$src"} \
+    --client-name="$CLIENT" --stream-name=mic-relay |
+    ssh "${SSH_OPTS[@]}" "$HOST" "pacat --playback --device=vmic ${FORMAT[*]} --latency-msec=60"
+}
+
+start() {
+  local src label since
+
+  # A second press while the first start waits for the passphrase is ignored.
+  exec 9>"$LOCK"
+  flock -n 9 || return 0
+
+  require_host
+  if is_running; then
+    note "Already streaming $(running_label) to $(server_name)" normal
+    return 0
+  fi
+  stream_up && fail "A stream started from a terminal is already running. Stop it there first."
+
+  src=$(resolve_mic "${1:-$MIC}" 2>&1) || fail "$src"
+  label=$(mic_label "$src")
+
+  ensure_ssh || return 1
+
+  # The background unit outlives shell and Hyprland restarts, stops the whole
+  # parec | ssh pipeline at once, and retries a dropped connection.
+  since=$(date +%s)
+  systemctl --user reset-failed "$UNIT" >/dev/null 2>&1
+  systemd-run --user --quiet --collect --unit="$UNIT" \
+    --description="SSH Mic Bridge: $label to $HOST" \
+    -p Restart=on-failure -p RestartSec=3 \
+    -p StartLimitIntervalSec=60 -p StartLimitBurst=5 \
+    -E SSH_AUTH_SOCK="${SSH_AUTH_SOCK:-}" -E PATH="$PATH" \
+    -E SSH_MIC_BRIDGE_HOST="$HOST" \
+    "$SELF" stream "${src:-default}" || fail "Could not start $UNIT"
+  printf '%s\n' "$label" >"$LABEL_FILE"
+  refresh_bar
+
+  for _ in {1..20}; do
+    sleep 0.5
+    stream_up && break
+  done
+  sleep 1
+
+  if stream_up && is_running; then
+    note "Streaming $label to $(server_name)"
+  else
+    systemctl --user stop "$UNIT" >/dev/null 2>&1
+    rm -f "$LABEL_FILE"
+    refresh_bar
+    fail "Failed to start ($label)"$'\n'"$(journalctl --user -u "$UNIT" --since "@$since" -o cat --no-pager 2>/dev/null | tail -n 2)"
+  fi
+}
+
+stop() {
+  if is_running; then
+    systemctl --user stop "$UNIT"
+  elif stream_up; then
+    # A foreground `stream` from a terminal. Its parec carries our client
+    # name, so this matches nothing else, and ending parec ends the pipeline.
+    pkill -f -- "--client-name=$CLIENT"
+  else
+    rm -f "$LABEL_FILE"
+    note "Not streaming" normal
+    refresh_bar
+    return 0
+  fi
+  rm -f "$LABEL_FILE"
+  note "Stopped"
+  refresh_bar
+}
+
+toggle() {
+  if is_running; then stop; else start "$@"; fi
+}
+
+pick() {
+  local current rows=() name desc mark selection
+  current=$(resolve_mic "$MIC" 2>/dev/null) || current="?"
+
+  mark=$([[ -z $current ]] && echo "✓" || printf '\U000F036C')
+  rows+=("$mark"$'\t'"Default input"$'\t'"default")
+  while IFS=$'\t' read -r name desc; do
+    [[ -n $name ]] || continue
+    mark=$([[ $name == "$current" ]] && echo "✓" || printf '\U000F036C')
+    rows+=("$mark"$'\t'"$desc"$'\t'"$name")
+  done < <(mics)
+
+  selection=$(omarchy-menu-select "Stream which microphone?" "${rows[@]}" -- --width 640) || return 0
+  name=${selection##*$'\t'}
+  [[ -n $name ]] || return 0
+
+  # Save the description when it names one mic: it survives the source
+  # being renamed (a sound card switching profiles does that).
+  desc=$(describe "$name")
+  if [[ $name != default && -n $desc && $(mics | awk -F '\t' -v d="$desc" '$2 == d' | wc -l) == 1 ]]; then
+    set_config SSH_MIC_BRIDGE_MIC "$desc"
+  else
+    set_config SSH_MIC_BRIDGE_MIC "$name"
+  fi
+  MIC=$name
+  if is_running; then
+    systemctl --user stop "$UNIT"
+    rm -f "$LABEL_FILE"
+  fi
+  start "$name"
+}
+
+status() {
+  if is_running; then
+    note "Streaming $(running_label) to $(server_name)" normal
+  else
+    note "Off. SUPER + ALT + V starts streaming $(mic_label "$(resolve_mic "$MIC" 2>/dev/null)") to $(server_name)." normal
+  fi
+}
+
+state() {
+  local running=false connecting=false mic
+  case $(unit_state) in
+    active) running=true ;;
+    activating) running=true connecting=true ;;
+  esac
+  mic=$([[ $running == true ]] && running_label || mic_label "$(resolve_mic "$MIC" 2>/dev/null)")
+  jq -cn --argjson running "$running" --argjson connecting "$connecting" \
+    --arg mic "$mic" --arg host "$(server_name)" --arg target "$HOST" \
+    '{running: $running, connecting: $connecting, mic: $mic, host: $host, target: $target}'
+}
+
+# Record what arrives at the server's virtual mic (your voice plus the faint
+# keep-alive floor) and play it back here.
+test_audio() {
+  local file pid level
+  require_host
+  is_running || start || exit 1
+  file=$(mktemp --suffix=.raw)
+  trap 'rm -f "$file"' EXIT
+
+  ssh "${SSH_OPTS[@]}" "$HOST" "exec parec --device=vmic_mic ${FORMAT[*]}" >"$file" &
+  pid=$!
+  sleep 1
+  echo
+  echo "Recording what $(server_name) hears. Speak now, then press Enter."
+  read -r _
+  kill "$pid" 2>/dev/null
+  wait "$pid" 2>/dev/null
+
+  level=$(python3 -c '
+import array, math, sys
+a = array.array("h")
+data = open(sys.argv[1], "rb").read()
+a.frombytes(data[: len(data) // 2 * 2])
+r = math.sqrt(sum(v * v for v in a) / len(a)) if a else 0
+print(f"{20 * math.log10(r / 32768):.0f}" if r else "silent")
+' "$file" 2>/dev/null)
+  echo "Average level: ${level} dBFS. The keep-alive floor alone is about -52; speech is well above it."
+  echo "Playing it back..."
+  pacat --playback --raw "${FORMAT[@]}" <"$file"
+}
+
+case "${1:-status}" in
+  start) shift; start "$@" ;;
+  stop) stop ;;
+  toggle) shift; toggle "$@" ;;
+  pick) pick ;;
+  mics) mics ;;
+  mic)
+    if [[ -n ${2:-} ]]; then
+      src=$(resolve_mic "$2") || exit 1
+      set_config SSH_MIC_BRIDGE_MIC "$2"
+      echo "Mic set to '$2': $(mic_label "$src")"
+      refresh_bar
+    else
+      echo "$MIC: $(mic_label "$(resolve_mic "$MIC")")"
+    fi
+    ;;
+  which)
+    src=$(resolve_mic "${2:-$MIC}") || exit 1
+    echo "${src:-$(pactl get-default-source 2>/dev/null)}"
+    ;;
+  host)
+    if [[ -n ${2:-} ]]; then
+      set_config SSH_MIC_BRIDGE_HOST "$2"
+      refresh_bar
+    else
+      [[ -n $HOST ]] && echo "$HOST"
+    fi
+    ;;
+  test) test_audio ;;
+  status) status ;;
+  state) state ;;
+  running) is_running ;;
+  log) journalctl --user -u "$UNIT" -b -o short --no-pager ;;
+  stream) shift; stream "$@" ;;
+  -h | --help | help) sed -n '3,/^$/s/^# \{0,1\}//p' "$SELF" ;;
+  *)
+    echo "ssh-mic-bridge: unknown command '$1' (try --help)" >&2
+    exit 1
+    ;;
+esac

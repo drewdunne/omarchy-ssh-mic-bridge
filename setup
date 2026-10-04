@@ -1,0 +1,481 @@
+#!/bin/bash
+
+# Set up SSH Mic Bridge on this machine and on the server.
+#
+# install            load SUPER + ALT + V from ~/.config/hypr/hyprland.lua, add
+#                    Trigger > SSH Mic Bridge to the Omarchy menu, put
+#                    ssh-mic-bridge on PATH and add the bar widget
+# server [user@host] install or update the virtual mic on the server
+# server --remove    remove it from the server again
+# uninstall          stop streaming and remove what install added here
+# status             show what is installed and check the server (read-only)
+
+set -euo pipefail
+
+ID="gg.arkship.ssh-mic-bridge"
+PLUGIN_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+CTL="$PLUGIN_DIR/bin/ssh-mic-bridge"
+HYPR_CONFIG="$HOME/.config/hypr/hyprland.lua"
+MENU_CONFIG="$HOME/.config/omarchy/extensions/omarchy-menu.jsonc"
+LINK="$HOME/.local/bin/ssh-mic-bridge"
+BEGIN_MARK=">>> $ID >>>"
+END_MARK="<<< $ID <<<"
+ANCHOR='require("default.hypr.omarchy")'
+SERVER_FILES=(".local/bin/vmic-keepalive" ".config/systemd/user/vmic-keepalive.service")
+YES=0
+REMOVE=0
+HOST_ARG=""
+
+usage() {
+  cat <<USAGE
+Usage: setup <install|uninstall|status> [--yes]
+       setup server [user@host] [--remove] [--yes]
+
+  install    Add the keybinding, menu, command and bar widget here
+  server     Install or update the virtual mic on the server (--remove to remove it)
+  uninstall  Stop streaming and remove what install added here
+  status     Show what is installed and check the server
+
+--yes skips confirmation prompts.
+USAGE
+}
+
+interactive() {
+  [[ -t 0 ]]
+}
+
+confirm() {
+  [[ $YES == 1 ]] && return 0
+  if ! interactive; then
+    echo "setup: no terminal to confirm in; pass --yes to proceed" >&2
+    exit 1
+  fi
+  read -r -p "$1 [y/N] " reply
+  [[ $reply == [yY]* ]]
+}
+
+backup() {
+  local backup
+  backup="$1.bak.$(date +%s)"
+  cp "$1" "$backup"
+  echo "Backed up $1 to $backup"
+}
+
+# has_block FILE COMMENT-PREFIX
+has_block() {
+  [[ -f $1 ]] && grep -qF -- "$2 $BEGIN_MARK" "$1"
+}
+
+# insert_block FILE ANCHOR-REGEX BLOCK: put BLOCK after the first line
+# matching ANCHOR-REGEX, with a blank line in front of it.
+insert_block() {
+  local tmp
+  tmp=$(mktemp)
+  BLOCK="$3" ANCHOR_RE="$2" awk '
+    { print }
+    !done && $0 ~ ENVIRON["ANCHOR_RE"] { print ""; print ENVIRON["BLOCK"]; done = 1 }
+  ' "$1" >"$tmp"
+  cat "$tmp" >"$1"
+  rm -f "$tmp"
+}
+
+# remove_block FILE COMMENT-PREFIX: drop the block and the blank line
+# insert_block put in front of it.
+remove_block() {
+  local tmp
+  tmp=$(mktemp)
+  BEGIN_LINE="$2 $BEGIN_MARK" END_LINE="$2 $END_MARK" awk '
+    { line = $0; sub(/^[ \t]+/, "", line) }
+    line == ENVIRON["BEGIN_LINE"] { skipping = 1; pending = 0; next }
+    skipping { if (line == ENVIRON["END_LINE"]) skipping = 0; next }
+    $0 == "" { if (pending) print ""; pending = 1; next }
+    { if (pending) print ""; pending = 0; print }
+    END { if (pending) print "" }
+  ' "$1" >"$tmp"
+  cat "$tmp" >"$1"
+  rm -f "$tmp"
+}
+
+hypr_block() {
+  cat <<LUA
+-- $BEGIN_MARK
+-- SSH Mic Bridge: SUPER + ALT + V streams your mic to the server.
+-- Remove this block (or run the plugin's \`setup uninstall\`) to go back.
+do
+  local path = os.getenv("HOME") .. "/.config/omarchy/plugins/$ID/hypr/ssh-mic-bridge.lua"
+  local file = io.open(path, "r")
+  if file then
+    file:close()
+    dofile(path)
+  end
+end
+-- $END_MARK
+LUA
+}
+
+# Every entry ends in a comma and the block goes right after the opening
+# brace, so it parses whatever the rest of the file holds (the menu drops a
+# trailing comma before the closing brace).
+menu_block() {
+  local sb="\$HOME/.config/omarchy/plugins/$ID/bin/ssh-mic-bridge"
+  local setup="\$HOME/.config/omarchy/plugins/$ID/setup"
+  local mic mic_off mic_settings headphones server
+  mic=$(printf '\U000F036C')
+  mic_off=$(printf '\U000F036D')
+  mic_settings=$(printf '\U000F036F')
+  headphones=$(printf '\U000F02CB')
+  server=$(printf '\U000F048B')
+  cat <<JSONC
+  // $BEGIN_MARK
+  // SSH Mic Bridge menu. Remove this block (or run the plugin's \`setup uninstall\`) to go back.
+  "trigger.ssh-mic-bridge": {"icon":"$mic","label":"SSH Mic Bridge","aliases":["ssh-mic-bridge","mic-bridge"],"description":"Stream your mic to a server over SSH"},
+  "trigger.ssh-mic-bridge.start": {"icon":"$mic","label":"Start","when":"! $sb running","action":"$sb start"},
+  "trigger.ssh-mic-bridge.stop": {"icon":"$mic_off","label":"Stop","when":"$sb running","action":"$sb stop"},
+  "trigger.ssh-mic-bridge.pick": {"icon":"$mic_settings","label":"Choose Microphone","action":"$sb pick"},
+  "trigger.ssh-mic-bridge.test": {"icon":"$headphones","label":"Hear What the Server Hears","action":"omarchy-launch-floating-terminal-with-presentation \\"$sb test\\""},
+  "trigger.ssh-mic-bridge.server": {"icon":"$server","label":"Set Up Server","action":"omarchy-launch-floating-terminal-with-presentation \\"$setup server\\""},
+  // $END_MARK
+JSONC
+}
+
+reload_hyprland() {
+  hyprctl reload >/dev/null
+  local errors
+  errors=$(hyprctl configerrors 2>/dev/null | grep -v '^\s*$' || true)
+  if [[ -n $errors ]]; then
+    echo "Hyprland reported config errors:" >&2
+    echo "$errors" >&2
+    return 1
+  fi
+}
+
+# The shell rescans plugins asynchronously, so a freshly copied plugin can
+# take a moment to become enable-able. Land next to the audio widget when the
+# bar has one.
+enable_widget() {
+  local placement=(--section right)
+  if jq -e '[.bar.layout[][]?.id] | index("omarchy.audio")' "$HOME/.config/omarchy/shell.json" >/dev/null 2>&1; then
+    placement=(--before omarchy.audio)
+  fi
+  omarchy-shell shell rescanPlugins >/dev/null 2>&1 || true
+  for _ in {1..20}; do
+    omarchy plugin enable "$ID" "${placement[@]}" >/dev/null 2>&1 && return 0
+    sleep 0.25
+  done
+  echo "Could not enable the bar widget; run: omarchy plugin enable $ID" >&2
+}
+
+widget_enabled() {
+  jq -e --arg id "$ID" '[.bar.layout[][]?.id] | index($id)' "$HOME/.config/omarchy/shell.json" >/dev/null 2>&1
+}
+
+check_tools() {
+  local missing=() tool
+  for tool in parec pacat pactl notify-send ssh ssh-add systemd-run xdg-terminal-exec jq python3; do
+    command -v "$tool" >/dev/null || missing+=("$tool")
+  done
+  if ((${#missing[@]})); then
+    echo "setup: missing ${missing[*]}" >&2
+    echo "Install them with: omarchy-pkg-add libpulse libnotify openssh xdg-terminal-exec jq python" >&2
+    exit 1
+  fi
+}
+
+# WirePlumber can store a mute for a capture stream, which makes it relay
+# silence while level meters still move. The bridge unmutes its own stream,
+# but say so if one is stored.
+check_stored_mute() {
+  local restore="$HOME/.local/state/wireplumber/restore-stream"
+  if [[ -f $restore ]] && grep -E '(parec|ssh-mic-bridge)' "$restore" | grep -q 'mute=true'; then
+    echo "Note: WirePlumber has a stored mute for parec or ssh-mic-bridge in $restore."
+    echo "The bridge unmutes its own stream; remove that entry if the server hears silence."
+  fi
+}
+
+configured_host() {
+  "$CTL" host 2>/dev/null || true
+}
+
+ask_host() {
+  local host
+  host=$(configured_host)
+  if interactive; then
+    read -r -e -i "$host" -p "Server to stream to (user@host): " host
+  fi
+  echo "$host"
+}
+
+install() {
+  check_tools
+  [[ -f $HYPR_CONFIG ]] || { echo "setup: $HYPR_CONFIG not found" >&2; exit 1; }
+
+  echo "This adds a loader block to $HYPR_CONFIG (SUPER + ALT + V),"
+  echo "a Trigger > SSH Mic Bridge block to $MENU_CONFIG,"
+  echo "a link at $LINK, and the bar widget."
+  confirm "Continue?" || exit 1
+
+  if has_block "$HYPR_CONFIG" "--"; then
+    echo "Hyprland already loads SSH Mic Bridge."
+  else
+    grep -qF -- "$ANCHOR" "$HYPR_CONFIG" || { echo "setup: $ANCHOR not found in $HYPR_CONFIG" >&2; exit 1; }
+    backup "$HYPR_CONFIG"
+    insert_block "$HYPR_CONFIG" "^require\\(\"default\\.hypr\\.omarchy\"\\)" "$(hypr_block)"
+  fi
+
+  if has_block "$MENU_CONFIG" "//"; then
+    echo "The menu already has SSH Mic Bridge."
+  else
+    if [[ -f $MENU_CONFIG ]]; then
+      backup "$MENU_CONFIG"
+    else
+      mkdir -p "$(dirname "$MENU_CONFIG")"
+      printf '{\n}\n' >"$MENU_CONFIG"
+    fi
+    grep -q '^[[:space:]]*{[[:space:]]*$' "$MENU_CONFIG" || { echo "setup: no opening { line in $MENU_CONFIG" >&2; exit 1; }
+    insert_block "$MENU_CONFIG" '^[[:space:]]*[{][[:space:]]*$' "$(menu_block)"
+  fi
+
+  mkdir -p "$(dirname "$LINK")"
+  if [[ -e $LINK && ! -L $LINK ]]; then
+    echo "Left $LINK alone: it is a file, not a link." >&2
+  else
+    ln -sfn "$CTL" "$LINK"
+  fi
+
+  enable_widget
+  check_stored_mute
+  reload_hyprland || { echo "Run '$0 uninstall' to undo." >&2; exit 1; }
+
+  echo
+  echo "SSH Mic Bridge is installed here."
+  if [[ -z $(configured_host) ]]; then
+    if interactive && [[ $YES != 1 ]] && confirm "Set up the server side now?"; then
+      server
+      return
+    fi
+    echo "Next, set up the server side: $0 server user@host"
+  else
+    echo "Server: $(configured_host). Check it with: $0 status"
+  fi
+}
+
+uninstall() {
+  confirm "Stop streaming and remove SSH Mic Bridge's keybinding, menu, command and bar widget?" || exit 1
+
+  if "$CTL" running; then "$CTL" stop || true; fi
+
+  if has_block "$HYPR_CONFIG" "--"; then
+    backup "$HYPR_CONFIG"
+    remove_block "$HYPR_CONFIG" "--"
+  fi
+  if has_block "$MENU_CONFIG" "//"; then
+    backup "$MENU_CONFIG"
+    remove_block "$MENU_CONFIG" "//"
+  fi
+  if [[ -L $LINK && $(readlink "$LINK") == "$CTL" ]]; then
+    rm -f "$LINK"
+  fi
+
+  omarchy plugin disable "$ID" >/dev/null 2>&1 || true
+  reload_hyprland || true
+  echo "SSH Mic Bridge is off here. Your settings stay in ~/.config/ssh-mic-bridge."
+  echo "The server side stays too; remove it with: $0 server --remove"
+  echo "Remove the plugin with: omarchy plugin remove $ID"
+}
+
+# ------------------------------------------------------------------ server
+
+# Read-only report on the server: prerequisites, installed files, and the
+# live virtual mic.
+server_report() {
+  ssh -o ConnectTimeout=10 "$1" bash -s <<'SH'
+missing=""
+for c in pactl pacat python3 systemctl; do command -v "$c" >/dev/null || missing="$missing $c"; done
+echo "missing=${missing# }"
+pactl info >/dev/null 2>&1 && echo "pulse=yes" || echo "pulse=no"
+for f in .local/bin/vmic-keepalive .config/systemd/user/vmic-keepalive.service; do
+  if [ -f "$HOME/$f" ]; then echo "file=$(md5sum < "$HOME/$f" | cut -d' ' -f1) $f"; else echo "file=none $f"; fi
+done
+echo "service=$(systemctl --user is-active vmic-keepalive 2>/dev/null)"
+echo "monitor=$(pactl list short sources 2>/dev/null | awk '$2 == "vmic.monitor" { print $NF }')"
+echo "default=$(pactl get-default-source 2>/dev/null)"
+echo "linger=$(loginctl show-user "$USER" -p Linger --value 2>/dev/null)"
+SH
+}
+
+report_value() {
+  sed -n "s/^$1=//p" <<<"$2" | head -1
+}
+
+server_files_match() {
+  local report=$1 f local_sum
+  for f in "${SERVER_FILES[@]}"; do
+    local_sum=$(md5sum <"$PLUGIN_DIR/server/${f##*/}" | cut -d' ' -f1)
+    grep -qxF "file=$local_sum $f" <<<"$report" || return 1
+  done
+}
+
+server_live() {
+  [[ $(report_value service "$1") == active &&
+    $(report_value monitor "$1") == RUNNING &&
+    $(report_value default "$1") == vmic_mic ]]
+}
+
+print_server_state() {
+  echo "  vmic-keepalive:  $(report_value service "$1")"
+  echo "  vmic.monitor:    $(report_value monitor "$1")"
+  echo "  default input:   $(report_value default "$1")"
+  if server_files_match "$1"; then
+    echo "  files:           same as this plugin"
+  else
+    echo "  files:           differ from this plugin (setup server updates them)"
+  fi
+}
+
+server_install() {
+  local host=$1 report missing f
+  echo "Checking $host..."
+  report=$(server_report "$host") || { echo "setup: can't reach $host over SSH" >&2; exit 1; }
+
+  missing=$(report_value missing "$report")
+  if [[ -n $missing || $(report_value pulse "$report") != yes ]]; then
+    [[ -n $missing ]] && echo "$host is missing: $missing" >&2
+    [[ $(report_value pulse "$report") == yes ]] || echo "$host has no PulseAudio or PipeWire sound server that pactl can reach." >&2
+    cat >&2 <<HINT
+Install PipeWire's PulseAudio server and tools there, then run this again:
+  Debian/Ubuntu: sudo apt install pipewire-pulse pulseaudio-utils python3
+  Fedora:        sudo dnf install pipewire-pulseaudio pulseaudio-utils python3
+  Arch:          sudo pacman -S pipewire-pulse libpulse python
+HINT
+    exit 1
+  fi
+
+  if server_files_match "$report" && server_live "$report"; then
+    echo "The virtual mic on $host is already set up and live."
+    print_server_state "$report"
+    return 0
+  fi
+
+  echo
+  echo "This installs vmic-keepalive on $host (in ~/.local/bin and"
+  echo "~/.config/systemd/user), starts it, and makes its virtual mic"
+  echo "(vmic_mic) the default input there. It replaces any existing copy."
+  confirm "Continue?" || exit 1
+
+  for f in "${SERVER_FILES[@]}"; do
+    # Write a new file and rename it: rewriting the running script in place
+    # could make its bash read garbage before the restart below.
+    ssh "$host" "mkdir -p \"\$HOME/${f%/*}\" && cat > \"\$HOME/$f.new\" && mv \"\$HOME/$f.new\" \"\$HOME/$f\"" <"$PLUGIN_DIR/server/${f##*/}"
+  done
+  ssh "$host" bash -s <<'SH'
+chmod +x ~/.local/bin/vmic-keepalive
+systemctl --user daemon-reload
+systemctl --user enable vmic-keepalive.service >/dev/null 2>&1
+systemctl --user restart vmic-keepalive.service
+# Linger starts it at boot, before anyone logs in. Without it, it starts with
+# the first SSH session (the bridge's own connection is one), which also works.
+if [ "$(loginctl show-user "$USER" -p Linger --value 2>/dev/null)" != yes ]; then
+  loginctl enable-linger "$USER" 2>/dev/null &&
+    echo "Enabled linger, so the virtual mic is up from boot." ||
+    echo "Linger is off (optional): 'sudo loginctl enable-linger $USER' there starts the virtual mic at boot."
+fi
+SH
+  sleep 2
+  report=$(server_report "$host")
+  print_server_state "$report"
+  if server_live "$report"; then
+    echo "The virtual mic on $host is live."
+  else
+    echo "setup: the virtual mic did not come up. On $host, check: journalctl --user -u vmic-keepalive" >&2
+    exit 1
+  fi
+}
+
+server_remove() {
+  local host=$1
+  confirm "Stop and remove the virtual mic on $host?" || exit 1
+  "$CTL" running && "$CTL" stop || true
+  ssh "$host" bash -s <<'SH'
+systemctl --user disable --now vmic-keepalive.service 2>/dev/null || true
+rm -f ~/.local/bin/vmic-keepalive ~/.config/systemd/user/vmic-keepalive.service
+systemctl --user daemon-reload
+for id in $(pactl list short modules 2>/dev/null | awk '/source_name=vmic_mic|sink_name=vmic( |$)/ { print $1 }' | sort -rn); do
+  pactl unload-module "$id" 2>/dev/null || true
+done
+echo "Removed. The default input there is now $(pactl get-default-source 2>/dev/null)."
+SH
+}
+
+server() {
+  local host=${HOST_ARG:-}
+  [[ -n $host ]] || host=$(ask_host)
+  [[ -n $host ]] || { echo "setup: no server given. Run: $0 server user@host" >&2; exit 1; }
+
+  if ((REMOVE)); then
+    server_remove "$host"
+    return
+  fi
+
+  # Interactive ssh may ask for a passphrase or a new host key here;
+  # AddKeysToAgent keeps the key for the background stream.
+  ssh -o ConnectTimeout=10 -o AddKeysToAgent=yes "$host" true || { echo "setup: can't ssh to $host" >&2; exit 1; }
+  "$CTL" host "$host"
+  echo "Server set to $host (in ~/.config/ssh-mic-bridge/config)."
+  server_install "$host"
+}
+
+# ------------------------------------------------------------------ status
+
+yes_no() {
+  if "$@"; then echo yes; else echo no; fi
+}
+
+on_path() {
+  command -v ssh-mic-bridge >/dev/null
+}
+
+status() {
+  local host report
+  host=$(configured_host)
+  echo "Keybinding loader: $(yes_no has_block "$HYPR_CONFIG" "--")"
+  echo "Menu entries:      $(yes_no has_block "$MENU_CONFIG" "//")"
+  echo "Bar widget:        $(yes_no widget_enabled)"
+  echo "Command on PATH:   $(yes_no on_path)"
+  echo "State:             $("$CTL" state)"
+
+  if [[ -z $host ]]; then
+    echo "Server:            not set. Run: $0 server user@host"
+    return 0
+  fi
+  if ! report=$(ssh -o BatchMode=yes -o ConnectTimeout=5 "$host" true 2>/dev/null && server_report "$host" 2>/dev/null); then
+    echo "Server ($host):    not checked (SSH needs a prompt; run: ssh $host)"
+    return 0
+  fi
+  echo "Server ($host):"
+  print_server_state "$report"
+}
+
+# ------------------------------------------------------------------ main
+
+command="${1:-}"
+shift || true
+for arg in "$@"; do
+  case $arg in
+    --yes | -y) YES=1 ;;
+    --remove) REMOVE=1 ;;
+    -*) usage >&2; exit 1 ;;
+    *)
+      [[ $command == server && -z $HOST_ARG ]] || { usage >&2; exit 1; }
+      HOST_ARG=$arg
+      ;;
+  esac
+done
+
+case $command in
+  install) install ;;
+  uninstall) uninstall ;;
+  server) server ;;
+  status) status ;;
+  -h | --help | help) usage ;;
+  *) usage >&2; exit 1 ;;
+esac

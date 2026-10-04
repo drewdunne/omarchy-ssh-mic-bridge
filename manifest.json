@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "gg.arkship.ssh-mic-bridge",
+  "name": "SSH Mic Bridge",
+  "version": "0.1.0",
+  "author": "Andrew Dunne",
+  "description": "Stream your microphone over SSH into a virtual mic on a server, so Claude Code's /voice (or any app there) hears you",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "SshMicBridge.qml"
+  },
+  "barWidget": {
+    "displayName": "SSH Mic Bridge",
+    "description": "Lights up while your mic streams to the server; click to start or stop",
+    "category": "Audio",
+    "defaultSection": "right",
+    "allowMultiple": false
+  }
+}

@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# vmic-keepalive: the server half of ssh-mic-bridge. Creates the "vmic" virtual
+# mic (a null sink whose monitor is remapped as the source "vmic_mic"), makes it
+# the default input, and keeps it live with a faint noise floor.
+#
+# Why the floor: a null sink's monitor is digital silence while nothing plays,
+# and speech-to-text services (Claude Code's /voice uses Deepgram) reject a
+# silent source as "No speech detected". A real mic always carries room noise.
+#
+# The floor is CONTINUOUS FRESH noise. Repeating one block freezes its random
+# peaks into an audible hum.
+#
+# Env:
+#   VMIC_FLOOR_AMP   peak sample amplitude of the floor (default 140, about
+#                    -47 dBFS peak or -52 dBFS RMS). 0 keeps the source open
+#                    without noise.
+set -euo pipefail
+
+pactl list short sinks   | grep -qw vmic     || \
+  pactl load-module module-null-sink sink_name=vmic \
+    sink_properties=device.description=SSH-Mic-Bridge >/dev/null
+pactl list short sources | grep -qw vmic_mic || \
+  pactl load-module module-remap-source master=vmic.monitor source_name=vmic_mic \
+    source_properties=device.description=SSH-Mic >/dev/null
+pactl set-default-source vmic_mic >/dev/null || true
+
+AMP="${VMIC_FLOOR_AMP:-140}"
+
+exec python3 - "$AMP" <<'PY' | pacat --playback --device=vmic \
+      --format=s16le --rate=48000 --channels=1 --raw --latency-msec=200
+import os, sys, struct
+amp = int(sys.argv[1])
+x = 2463534242
+out = os.fdopen(sys.stdout.fileno(), "wb", 0)
+CH = 2400  # 50 ms chunk @ 48k
+while True:
+    b = bytearray()
+    for _ in range(CH):                       # fresh noise every chunk (no repeats)
+        x ^= (x << 13) & 0xffffffff
+        x ^= x >> 17
+        x ^= (x << 5) & 0xffffffff
+        v = (x % (2 * amp + 1)) - amp if amp else 0
+        b += struct.pack("<h", v)
+    out.write(bytes(b))
+PY

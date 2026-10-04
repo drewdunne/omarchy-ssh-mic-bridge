@@ -1,0 +1,12 @@
+[Unit]
+Description=ssh-mic-bridge virtual mic (vmic) with a keep-alive noise floor
+After=pipewire-pulse.service pulseaudio.service
+Wants=pipewire-pulse.service
+
+[Service]
+ExecStart=%h/.local/bin/vmic-keepalive
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target
