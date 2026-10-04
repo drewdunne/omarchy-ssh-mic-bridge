@@ -293,6 +293,13 @@ missing=""
 for c in pactl pacat python3 systemctl; do command -v "$c" >/dev/null || missing="$missing $c"; done
 echo "missing=${missing# }"
 pactl info >/dev/null 2>&1 && echo "pulse=yes" || echo "pulse=no"
+# Claude Code records through ALSA, so ALSA's default device must lead to the
+# sound server (pipewire-alsa, or PulseAudio's ALSA plugin) to hear vmic_mic.
+if ls /etc/alsa/conf.d /usr/share/alsa/alsa.conf.d 2>/dev/null | grep -qE '^99-(pipewire-default|pulse)\.conf$'; then
+  echo "alsa=yes"
+else
+  echo "alsa=no"
+fi
 for f in .local/bin/vmic-keepalive .config/systemd/user/vmic-keepalive.service; do
   if [ -f "$HOME/$f" ]; then echo "file=$(md5sum < "$HOME/$f" | cut -d' ' -f1) $f"; else echo "file=none $f"; fi
 done
@@ -325,6 +332,12 @@ print_server_state() {
   echo "  vmic-keepalive:  $(report_value service "$1")"
   echo "  vmic.monitor:    $(report_value monitor "$1")"
   echo "  default input:   $(report_value default "$1")"
+  if [[ $(report_value alsa "$1") == yes ]]; then
+    echo "  ALSA default:    the sound server (Claude Code can hear vmic_mic)"
+  else
+    echo "  ALSA default:    not the sound server. Claude Code records through ALSA,"
+    echo "                   so install pipewire-alsa there or /voice won't hear the bridge."
+  fi
   if server_files_match "$1"; then
     echo "  files:           same as this plugin"
   else
@@ -343,9 +356,9 @@ server_install() {
     [[ $(report_value pulse "$report") == yes ]] || echo "$host has no PulseAudio or PipeWire sound server that pactl can reach." >&2
     cat >&2 <<HINT
 Install PipeWire's PulseAudio server and tools there, then run this again:
-  Debian/Ubuntu: sudo apt install pipewire-pulse pulseaudio-utils python3
-  Fedora:        sudo dnf install pipewire-pulseaudio pulseaudio-utils python3
-  Arch:          sudo pacman -S pipewire-pulse libpulse python
+  Debian/Ubuntu: sudo apt install pipewire-pulse pipewire-alsa pulseaudio-utils python3
+  Fedora:        sudo dnf install pipewire-pulseaudio pipewire-alsa pulseaudio-utils python3
+  Arch:          sudo pacman -S pipewire-pulse pipewire-alsa libpulse python
 HINT
     exit 1
   fi
@@ -385,6 +398,9 @@ SH
   print_server_state "$report"
   if server_live "$report"; then
     echo "The virtual mic on $host is live."
+    if [[ $(report_value alsa "$report") != yes ]]; then
+      echo "For Claude Code's /voice, also install pipewire-alsa on $host (see ALSA default above)."
+    fi
   else
     echo "setup: the virtual mic did not come up. On $host, check: journalctl --user -u vmic-keepalive" >&2
     exit 1

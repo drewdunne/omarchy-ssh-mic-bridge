@@ -1,16 +1,56 @@
 # SSH Mic Bridge
 
-An [Omarchy](https://omarchy.org/) plugin that streams your microphone over
-SSH into a virtual mic on a server. Apps on the server that record the default
-mic hear you as if the mic were plugged in there.
+### Talk to Claude Code on your server. Over SSH. Finally.
 
-It was built for Claude Code's `/voice`. Dictation records the machine Claude
-runs on, so it can't hear you when Claude runs over SSH on a server. With the
-bridge on, it can. Any recording app on the server works the same way.
+> **A local microphone:** voice dictation does not work in cloud sessions or
+> SSH sessions.
+>
+> — [Claude Code docs, Voice dictation](https://code.claude.com/docs/en/voice-dictation#requirements)
+
+Claude Code's `/voice` is great, until your Claude lives on a server. It
+records the machine Claude runs on, and a headless box in a closet has no
+microphone. So you've been typing.
+
+**With SSH Mic Bridge, "voice mode doesn't work over SSH" is a thing of the
+past.** Press SUPER + ALT + V, run `/voice` in your SSH session, and talk.
+Your words land in Claude's prompt on the server, as if your mic were plugged
+in there.
 
 ```
-your mic -> parec -> ssh you@server -> pacat -> vmic -> vmic_mic (server's default input)
+your mic ──parec──▶ ssh you@server ──pacat──▶ vmic ──▶ vmic_mic (the server's default input) ──▶ Claude /voice
 ```
+
+It's an [Omarchy](https://omarchy.org/) plugin, so it feels like part of your
+desktop. It isn't only for Claude, either: anything on the server that records
+the default mic hears you.
+
+## Why it's nice
+
+- **One key and you're live.** SUPER + ALT + V, or a click on the mic in your
+  bar. The icon lights up while you're streaming, so you always know.
+- **Any mic you own.** A USB mic, a headset, or an audio interface. Pick it from
+  a menu, or name it: `ssh-mic-bridge mic "Yeti"`.
+- **Just SSH.** It rides the SSH access you already have: no ports to open, no
+  audio server exposed on the network, nothing to configure on your router.
+- **Transcribes like a real mic.** A virtual mic is digital silence between
+  words, and speech-to-text gives up on silence. The server half plays a faint,
+  ever-changing noise floor underneath, like the room noise a real mic always
+  picks up, so Claude stays listening.
+- **Shrugs off hiccups.** It runs as a user service that survives shell and
+  Hyprland restarts, and reconnects by itself after a network blip.
+- **Three commands to set up**, and `setup server` does the server side for
+  you, checking and asking first.
+
+## Quick start
+
+```bash
+omarchy plugin add https://github.com/drewdunne/omarchy-ssh-mic-bridge.git --yes
+~/.config/omarchy/plugins/gg.arkship.ssh-mic-bridge/setup install
+~/.config/omarchy/plugins/gg.arkship.ssh-mic-bridge/setup server you@server
+```
+
+Then: SUPER + ALT + V, `ssh you@server`, `claude`, `/voice tap`, and start
+talking.
 
 ## What you get
 
@@ -29,17 +69,14 @@ tooltip names the mic and the server.
 
 - **This machine:** Omarchy 4 (Hyprland 0.56+ with Lua config, PipeWire), and
   SSH access to the server.
-- **Server:** Linux with a systemd user session, `python3`, and a PulseAudio
-  server that `pactl` can reach. PipeWire's `pipewire-pulse` is the usual one,
-  and plain PulseAudio works too. No GUI and no open ports are needed.
+- **Server:** Linux with a systemd user session, `python3`, and PipeWire with
+  `pipewire-pulse` and `pipewire-alsa`. Plain PulseAudio with its ALSA plugin
+  works too. No GUI, no sound card and no open ports are needed. The ALSA part
+  matters because Claude Code records through ALSA, and `pipewire-alsa` points
+  ALSA at the virtual mic. `setup server` checks for all of this and tells you
+  what to install.
 
-## Install
-
-```bash
-omarchy plugin add https://github.com/drewdunne/omarchy-ssh-mic-bridge.git --yes
-~/.config/omarchy/plugins/gg.arkship.ssh-mic-bridge/setup install
-~/.config/omarchy/plugins/gg.arkship.ssh-mic-bridge/setup server you@server
-```
+## What setup does
 
 `setup install` asks before changing anything. It backs up and adds a small
 marked block to `~/.config/hypr/hyprland.lua` (the keybinding) and to
@@ -126,6 +163,7 @@ ssh-mic-bridge log    # this boot's log
 |---|---|
 | "Failed to start", Permission denied (publickey) | Run `ssh you@server` once in a terminal, or start again and type the passphrase in the terminal that opens |
 | "No virtual mic on the server" | `setup server` |
+| Claude says "Voice mode requires a microphone" or "No audio detected from microphone" | Claude records through ALSA: install `pipewire-alsa` on the server (`setup status` shows "ALSA default") |
 | Transcript empty, "No speech detected" | `setup status`: vmic.monitor must be RUNNING and the default input vmic_mic |
 | The server hears only a flat -52 dBFS in `test` | Only the noise floor arrives: is your mic muted, or the wrong one chosen? (`ssh-mic-bridge which`) |
 | It keeps reconnecting, then stops | The server or the network is down: `ssh-mic-bridge log` |
