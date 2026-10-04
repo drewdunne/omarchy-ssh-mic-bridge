@@ -16,6 +16,11 @@ past.** Press SUPER + ALT + V, run `/voice` in your SSH session, and talk.
 Your words land in Claude's prompt on the server, as if your mic were plugged
 in there.
 
+![Claude Code in an SSH session on an Ubuntu server, taking dictation from a GoXLR on an Omarchy desktop: the bar mic is lit, a notification says the bridge is streaming, the prompt shows REC, and Claude replies "I can hear you fine over SSH."](assets/demo.png)
+
+*Claude Code running on an Ubuntu server over SSH, hearing a mic plugged into
+an Omarchy desktop. Spoken, not typed.*
+
 ```
 your mic ──parec──▶ ssh you@server ──pacat──▶ vmic ──▶ vmic_mic (the server's default input) ──▶ Claude /voice
 ```
