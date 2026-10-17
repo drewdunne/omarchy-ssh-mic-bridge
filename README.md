@@ -158,7 +158,12 @@ your ears ◀─pacat─── ┘                               └── vspk.
   the first one is told the voice moved.
 - **Stops by itself** after five quiet minutes (`VBRIDGE_IDLE_MINUTES` on the
   server; 0 for never).
-- **Use headphones.** On speakers, the agent hears itself through your mic.
+- **Speakers work too.** Without headphones, the agent's voice would play
+  into your mic and reach the server again, so it would hear itself. Unless
+  replies play in headphones, a headset or a Bluetooth output, talking loads
+  PipeWire's echo canceller between your mic and your output, which takes what
+  it plays out of what the mic hears, and removes it when you stop
+  (`SSH_MIC_BRIDGE_ECHO_CANCEL=auto`, the default; `on` or `off` to choose).
 - **Quick.** Over Tailscale it adds about 0.1 s each way.
 
 From a terminal: `ssh-mic-bridge talk [mode]` and `ssh-mic-bridge talk-stop`.
@@ -174,6 +179,7 @@ SSH_MIC_BRIDGE_HOST=you@server   # where the virtual mic lives
 SSH_MIC_BRIDGE_MIC=Yeti          # default, a source name, or part of a mic's name
 SSH_MIC_BRIDGE_TALK_MODE=talk    # what talking two-way asks the server's hooks for
 SSH_MIC_BRIDGE_SPEAKER=          # where replies play; empty for the default output
+SSH_MIC_BRIDGE_ECHO_CANCEL=auto  # cancel echo unless replies play in headphones; on; off
 ```
 
 To use a different key, edit `~/.config/hypr/bindings.lua`:

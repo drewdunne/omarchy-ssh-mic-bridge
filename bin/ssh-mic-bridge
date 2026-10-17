@@ -25,7 +25,8 @@
 # talk-stop     stop talking
 # talk-toggle   start talking if not, stop if talking
 # talking       exit 0 if talking
-# talk-stream [mode] [mic]  talk in the foreground (what the talk unit runs)
+# talk-stream [mode] [mic] [output]  talk in the foreground (what the talk
+#               unit runs)
 #
 # A mic is "default" (the system default input), an exact source name from
 # `ssh-mic-bridge mics`, or any part of a microphone's name, like "Yeti".
@@ -37,6 +38,8 @@
 #                        (default: talk)
 #   SSH_MIC_BRIDGE_SPEAKER    where talk plays replies (default: the default
 #                        output)
+#   SSH_MIC_BRIDGE_ECHO_CANCEL  auto (default): cancel echo while talking unless
+#                        replies play in headphones; on; or off
 
 set -uo pipefail
 
@@ -53,6 +56,9 @@ TALK_CLIENT=ssh-mic-bridge-talk
 TALK_STATE=$RUNTIME/ssh-mic-bridge.talk          # "connecting" or "ready"
 TALK_REASON=$RUNTIME/ssh-mic-bridge.talk-reason  # why talking stopped
 RESUME_FILE=$RUNTIME/ssh-mic-bridge.resume       # mic-only was on before talking
+EC_FILE=$RUNTIME/ssh-mic-bridge.echo-cancel      # the echo canceller's module, and the defaults before it
+EC_MIC=ssh_mic_bridge_ec_mic
+EC_OUT=ssh_mic_bridge_ec_out
 
 # The contract with the server: raw s16le, 48 kHz, mono into the "vmic" sink.
 FORMAT=(--format=s16le --rate=48000 --channels=1)
@@ -63,6 +69,7 @@ HOST=${SSH_MIC_BRIDGE_HOST:-}
 MIC=${SSH_MIC_BRIDGE_MIC:-default}
 TALK_MODE=${SSH_MIC_BRIDGE_TALK_MODE:-talk}
 SPEAKER=${SSH_MIC_BRIDGE_SPEAKER:-}
+ECHO_CANCEL=${SSH_MIC_BRIDGE_ECHO_CANCEL:-auto}
 
 note() {
   notify-send -u "${2:-low}" "SSH Mic Bridge" "$1"
@@ -344,8 +351,59 @@ talk_status() {
   done
 }
 
+# Whether replies played on this output reach only your ears: headphones, a
+# headset, earbuds, or a Bluetooth output, by what PipeWire says of it.
+in_ears() {
+  local out=${1:-$(pactl get-default-sink 2>/dev/null)}
+  pactl -f json list sinks 2>/dev/null | jq -e --arg n "$out" '
+    .[] | select(.name == $n)
+    | ((.properties["device.form_factor"] // "") | test("head|ear|hands-free"))
+      or (.properties["device.bus"] // "") == "bluetooth"
+      or ((.active_port // "") | test("head|ear"; "i"))' >/dev/null
+}
+
+# Without headphones, the agent's voice plays from the speakers into the mic
+# and back to the server, where it hears itself. PipeWire's echo canceller
+# takes what's played out of what the mic hears: it's loaded for the talk
+# between this mic and output, and echo_cancel_off removes it. Prints the mic
+# and output to talk through ("source<TAB>sink"), or nothing to use them as
+# they are.
+echo_cancel_on() {
+  local src=$1 out=$2 sink source id
+  case $ECHO_CANCEL in
+    off) return 0 ;;
+    auto) in_ears "$out" && return 0 ;;
+  esac
+  sink=$(pactl get-default-sink 2>/dev/null)
+  source=$(pactl get-default-source 2>/dev/null)
+  id=$(pactl load-module module-echo-cancel aec_method=webrtc \
+    source_name="$EC_MIC" sink_name="$EC_OUT" \
+    source_master="${src:-$source}" sink_master="${out:-$sink}" \
+    source_properties=device.description=SSH-Mic-Bridge-Echo-Cancelled-Mic \
+    sink_properties=device.description=SSH-Mic-Bridge-Echo-Cancelled-Output 2>/dev/null) || return 0
+  [[ $id =~ ^[0-9]+$ ]] || return 0
+  printf '%s\t%s\t%s\n' "$id" "$sink" "$source" >"$EC_FILE"
+  # Loading it mustn't move anything else: keep the defaults as they were.
+  [[ $(pactl get-default-sink 2>/dev/null) == "$sink" ]] || pactl set-default-sink "$sink"
+  [[ $(pactl get-default-source 2>/dev/null) == "$source" ]] || pactl set-default-source "$source"
+  for _ in {1..20}; do
+    pactl list short sources 2>/dev/null | grep -qw "$EC_MIC" && break
+    sleep 0.1
+  done
+  printf '%s\t%s\n' "$EC_MIC" "$EC_OUT"
+}
+
+echo_cancel_off() {
+  local id sink source
+  IFS=$'\t' read -r id sink source <"$EC_FILE" 2>/dev/null || return 0
+  rm -f "$EC_FILE"
+  pactl unload-module "$id" 2>/dev/null || true
+  [[ -z $sink || $(pactl get-default-sink 2>/dev/null) == "$sink" ]] || pactl set-default-sink "$sink" 2>/dev/null
+  [[ -z $source || $(pactl get-default-source 2>/dev/null) == "$source" ]] || pactl set-default-source "$source" 2>/dev/null
+}
+
 talk_stream() {
-  local mode=${1:-$TALK_MODE} src code tries=0
+  local mode=${1:-$TALK_MODE} out=${3:-$SPEAKER} src code tries=0
   require_host
   [[ $mode =~ ^[a-z0-9][a-z0-9-]{0,31}$ ]] || { echo "ssh-mic-bridge: a mode is lowercase letters, digits and dashes" >&2; exit 2; }
   src=$(resolve_mic "${2:-$MIC}") || exit 1
@@ -355,7 +413,7 @@ talk_stream() {
     parec "${FORMAT[@]}" --latency-msec=30 ${src:+--device="$src"} \
       --client-name="$TALK_CLIENT" --stream-name=talk-mic |
       ssh "${SSH_OPTS[@]}" "$HOST" "exec \"\$HOME/.local/bin/vbridge-attach\" $mode" 2> >(talk_status) |
-      pacat --playback "${FORMAT[@]}" --latency-msec=60 ${SPEAKER:+--device="$SPEAKER"} \
+      pacat --playback "${FORMAT[@]}" --latency-msec=60 ${out:+--device="$out"} \
         --client-name="$TALK_CLIENT" --stream-name=talk-replies
     code=${PIPESTATUS[1]}
     wait # for talk_status, the process substitution, to write its last word
@@ -373,7 +431,7 @@ talk_stream() {
 }
 
 talk() {
-  local mode=${1:-$TALK_MODE} src label
+  local mode=${1:-$TALK_MODE} src label ec talk_mic talk_out
 
   exec 9>"$LOCK"
   flock -n 9 || return 0
@@ -397,6 +455,12 @@ talk() {
 
   rm -f "$TALK_REASON"
   echo connecting >"$TALK_STATE"
+  echo_cancel_off # one left by a talk that ended without talk-ended
+  talk_mic=${src:-default} talk_out=$SPEAKER
+  if ec=$(echo_cancel_on "$src" "$SPEAKER") && [[ -n $ec ]]; then
+    IFS=$'\t' read -r talk_mic talk_out <<<"$ec"
+    label="$label, echo cancelled"
+  fi
   systemctl --user reset-failed "$TALK_UNIT" >/dev/null 2>&1
   systemd-run --user --quiet --collect --unit="$TALK_UNIT" \
     --description="SSH Mic Bridge: talking two-way with $HOST ($mode, $label)" \
@@ -404,7 +468,7 @@ talk() {
     -E SSH_AUTH_SOCK="${SSH_AUTH_SOCK:-}" -E PATH="$PATH" \
     -E SSH_MIC_BRIDGE_HOST="$HOST" -E XDG_RUNTIME_DIR="$RUNTIME" \
     -E DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-}" -E WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-}" \
-    "$SELF" talk-stream "$mode" "${src:-default}" || fail "Could not start $TALK_UNIT"
+    "$SELF" talk-stream "$mode" "$talk_mic" "$talk_out" || { echo_cancel_off; fail "Could not start $TALK_UNIT"; }
   note "Connecting to $(server_name) ($mode)…"
   refresh_bar
 }
@@ -428,6 +492,7 @@ talk_ended() {
   local why
   why=$(cat "$TALK_REASON" 2>/dev/null)
   rm -f "$TALK_STATE" "$TALK_REASON"
+  echo_cancel_off
   if [[ -z $why ]]; then
     case ${EXIT_STATUS:-0} in
       0 | 15 | TERM) why="Stopped talking" ;;
