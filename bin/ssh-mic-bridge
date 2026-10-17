@@ -18,12 +18,25 @@
 # log           show this boot's log
 # stream [mic]  stream in the foreground (what the background unit runs)
 #
+# Two-way ("talk"): your mic goes to the server and what plays into its reply
+# sink comes back, over one SSH connection, for an app there that talks back
+# (Codex's voice). The mic-only stream pauses meanwhile.
+# talk [mode]   start talking; mode is passed to the server's hooks
+# talk-stop     stop talking
+# talk-toggle   start talking if not, stop if talking
+# talking       exit 0 if talking
+# talk-stream [mode] [mic]  talk in the foreground (what the talk unit runs)
+#
 # A mic is "default" (the system default input), an exact source name from
 # `ssh-mic-bridge mics`, or any part of a microphone's name, like "Yeti".
 #
 # Settings live in ~/.config/ssh-mic-bridge/config, or the environment:
 #   SSH_MIC_BRIDGE_HOST  the server, as user@host (required)
 #   SSH_MIC_BRIDGE_MIC   the mic to stream (default: default)
+#   SSH_MIC_BRIDGE_TALK_MODE  the mode talk asks the server's hooks for
+#                        (default: talk)
+#   SSH_MIC_BRIDGE_SPEAKER    where talk plays replies (default: the default
+#                        output)
 
 set -uo pipefail
 
@@ -35,6 +48,11 @@ CONFIG=${XDG_CONFIG_HOME:-$HOME/.config}/ssh-mic-bridge/config
 RUNTIME=${XDG_RUNTIME_DIR:-/tmp}
 LABEL_FILE=$RUNTIME/ssh-mic-bridge.mic
 LOCK=$RUNTIME/ssh-mic-bridge.lock
+TALK_UNIT=ssh-mic-bridge-talk.service
+TALK_CLIENT=ssh-mic-bridge-talk
+TALK_STATE=$RUNTIME/ssh-mic-bridge.talk          # "connecting" or "ready"
+TALK_REASON=$RUNTIME/ssh-mic-bridge.talk-reason  # why talking stopped
+RESUME_FILE=$RUNTIME/ssh-mic-bridge.resume       # mic-only was on before talking
 
 # The contract with the server: raw s16le, 48 kHz, mono into the "vmic" sink.
 FORMAT=(--format=s16le --rate=48000 --channels=1)
@@ -43,6 +61,8 @@ SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=5 -o Serv
 [[ -f $CONFIG ]] && source "$CONFIG"
 HOST=${SSH_MIC_BRIDGE_HOST:-}
 MIC=${SSH_MIC_BRIDGE_MIC:-default}
+TALK_MODE=${SSH_MIC_BRIDGE_TALK_MODE:-talk}
+SPEAKER=${SSH_MIC_BRIDGE_SPEAKER:-}
 
 note() {
   notify-send -u "${2:-low}" "SSH Mic Bridge" "$1"
@@ -156,6 +176,13 @@ running_label() {
   cat "$LABEL_FILE" 2>/dev/null || echo "?"
 }
 
+is_talking() {
+  case $(systemctl --user is-active "$TALK_UNIT" 2>/dev/null) in
+    active | activating) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 # ------------------------------------------------------------------ ssh
 
 # The stream runs in the background with BatchMode, so SSH must work without
@@ -226,6 +253,12 @@ start() {
   flock -n 9 || return 0
 
   require_host
+  if is_talking; then
+    # The mic key while talking switches to mic only.
+    rm -f "$RESUME_FILE"
+    echo "Switched to mic only" >"$TALK_REASON"
+    systemctl --user stop "$TALK_UNIT"
+  fi
   if is_running; then
     note "Already streaming $(running_label) to $(server_name)" normal
     return 0
@@ -289,6 +322,127 @@ toggle() {
   if is_running; then stop; else start "$@"; fi
 }
 
+# ------------------------------------------------------------------ talk
+
+# The server's "vbridge: ..." status lines (server/vbridge-attach), shown as
+# notifications and kept for the bar and for talk-ended.
+talk_status() {
+  local line said
+  while IFS= read -r line; do
+    echo "$line" >&2
+    case $line in
+      "vbridge: ready"*)
+        said=${line#vbridge: ready}
+        echo ready >"$TALK_STATE"
+        note "${said# }"$'\n'"Talking two-way with $(server_name). SUPER + SHIFT + V stops."
+        refresh_bar
+        ;;
+      "vbridge: not ready: "*) echo "${line#vbridge: not ready: }" >"$TALK_REASON" ;;
+      "vbridge: taken over") echo "Voice moved to another device" >"$TALK_REASON" ;;
+      "vbridge: idle") echo "Stopped talking after a few quiet minutes" >"$TALK_REASON" ;;
+    esac
+  done
+}
+
+talk_stream() {
+  local mode=${1:-$TALK_MODE} src code tries=0
+  require_host
+  [[ $mode =~ ^[a-z0-9][a-z0-9-]{0,31}$ ]] || { echo "ssh-mic-bridge: a mode is lowercase letters, digits and dashes" >&2; exit 2; }
+  src=$(resolve_mic "${2:-$MIC}") || exit 1
+  command -v parec >/dev/null || { echo "ssh-mic-bridge: parec not found (install libpulse)" >&2; exit 1; }
+
+  while :; do
+    parec "${FORMAT[@]}" --latency-msec=30 ${src:+--device="$src"} \
+      --client-name="$TALK_CLIENT" --stream-name=talk-mic |
+      ssh "${SSH_OPTS[@]}" "$HOST" "exec \"\$HOME/.local/bin/vbridge-attach\" $mode" 2> >(talk_status) |
+      pacat --playback "${FORMAT[@]}" --latency-msec=60 ${SPEAKER:+--device="$SPEAKER"} \
+        --client-name="$TALK_CLIENT" --stream-name=talk-replies
+    code=${PIPESTATUS[1]}
+    wait # for talk_status, the process substitution, to write its last word
+    case $code in
+      127) echo "Two-way isn't set up on $(server_name). Run the plugin's setup server" >"$TALK_REASON"; exit 1 ;;
+      255) ;; # the connection dropped: try again, a few times
+      *) exit "$code" ;;
+    esac
+    tries=$((tries + 1))
+    ((tries < 5)) || exit 255
+    echo connecting >"$TALK_STATE"
+    refresh_bar
+    sleep 2
+  done
+}
+
+talk() {
+  local mode=${1:-$TALK_MODE} src label
+
+  exec 9>"$LOCK"
+  flock -n 9 || return 0
+
+  require_host
+  if is_talking; then
+    note "Already talking two-way with $(server_name)" normal
+    return 0
+  fi
+  src=$(resolve_mic "$MIC" 2>&1) || fail "$src"
+  label=$(mic_label "$src")
+  ensure_ssh || return 1
+
+  # The mic-only stream pauses while talking, so your voice doesn't reach the
+  # server twice; talk-ended starts it again.
+  if is_running; then
+    touch "$RESUME_FILE"
+    systemctl --user stop "$UNIT"
+    rm -f "$LABEL_FILE"
+  fi
+
+  rm -f "$TALK_REASON"
+  echo connecting >"$TALK_STATE"
+  systemctl --user reset-failed "$TALK_UNIT" >/dev/null 2>&1
+  systemd-run --user --quiet --collect --unit="$TALK_UNIT" \
+    --description="SSH Mic Bridge: talking two-way with $HOST ($mode, $label)" \
+    -p ExecStopPost="$SELF talk-ended" \
+    -E SSH_AUTH_SOCK="${SSH_AUTH_SOCK:-}" -E PATH="$PATH" \
+    -E SSH_MIC_BRIDGE_HOST="$HOST" -E XDG_RUNTIME_DIR="$RUNTIME" \
+    -E DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-}" -E WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-}" \
+    "$SELF" talk-stream "$mode" "${src:-default}" || fail "Could not start $TALK_UNIT"
+  note "Connecting to $(server_name) ($mode)…"
+  refresh_bar
+}
+
+talk_stop() {
+  if is_talking; then
+    [[ -f $TALK_REASON ]] || echo "Stopped talking" >"$TALK_REASON"
+    systemctl --user stop "$TALK_UNIT"
+  else
+    note "Not talking" normal
+  fi
+}
+
+talk_toggle() {
+  if is_talking; then talk_stop; else talk "$@"; fi
+}
+
+# Runs once the talk unit has stopped, whatever stopped it: says why, and
+# starts the mic-only stream again if talking paused it.
+talk_ended() {
+  local why
+  why=$(cat "$TALK_REASON" 2>/dev/null)
+  rm -f "$TALK_STATE" "$TALK_REASON"
+  if [[ -z $why ]]; then
+    case ${EXIT_STATUS:-0} in
+      0 | 15 | TERM) why="Stopped talking" ;;
+      255) why="Lost the connection to $(server_name)" ;;
+      *) why="Talking stopped (exit ${EXIT_STATUS})" ;;
+    esac
+  fi
+  note "$why" normal
+  refresh_bar
+  if [[ -f $RESUME_FILE ]]; then
+    rm -f "$RESUME_FILE"
+    start
+  fi
+}
+
 pick() {
   local current rows=() name desc mark selection
   current=$(resolve_mic "$MIC" 2>/dev/null) || current="?"
@@ -322,7 +476,9 @@ pick() {
 }
 
 status() {
-  if is_running; then
+  if is_talking; then
+    note "Talking two-way with $(server_name) ($TALK_MODE)" normal
+  elif is_running; then
     note "Streaming $(running_label) to $(server_name)" normal
   else
     note "Off. SUPER + ALT + V starts streaming $(mic_label "$(resolve_mic "$MIC" 2>/dev/null)") to $(server_name)." normal
@@ -330,15 +486,21 @@ status() {
 }
 
 state() {
-  local running=false connecting=false mic
+  local running=false connecting=false talking=false talk_ready=false mic
   case $(unit_state) in
     active) running=true ;;
     activating) running=true connecting=true ;;
   esac
+  if is_talking; then
+    talking=true
+    [[ $(cat "$TALK_STATE" 2>/dev/null) == ready ]] && talk_ready=true
+  fi
   mic=$([[ $running == true ]] && running_label || mic_label "$(resolve_mic "$MIC" 2>/dev/null)")
   jq -cn --argjson running "$running" --argjson connecting "$connecting" \
+    --argjson talking "$talking" --argjson talk_ready "$talk_ready" --arg mode "$TALK_MODE" \
     --arg mic "$mic" --arg host "$(server_name)" --arg target "$HOST" \
-    '{running: $running, connecting: $connecting, mic: $mic, host: $host, target: $target}'
+    '{running: $running, connecting: $connecting, talking: $talking, talk_ready: $talk_ready,
+      mode: $mode, mic: $mic, host: $host, target: $target}'
 }
 
 # Record what arrives at the server's virtual mic (your voice plus the faint
@@ -406,6 +568,12 @@ case "${1:-status}" in
   running) is_running ;;
   log) journalctl --user -u "$UNIT" -b -o short --no-pager ;;
   stream) shift; stream "$@" ;;
+  talk) shift; talk "$@" ;;
+  talk-stop) talk_stop ;;
+  talk-toggle) shift; talk_toggle "$@" ;;
+  talking) is_talking ;;
+  talk-stream) shift; talk_stream "$@" ;;
+  talk-ended) talk_ended ;;
   -h | --help | help) sed -n '3,/^$/s/^# \{0,1\}//p' "$SELF" ;;
   *)
     echo "ssh-mic-bridge: unknown command '$1' (try --help)" >&2

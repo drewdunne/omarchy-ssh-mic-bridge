@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # vmic-keepalive: the server half of ssh-mic-bridge. Creates the "vmic" virtual
 # mic (a null sink whose monitor is remapped as the source "vmic_mic"), makes it
-# the default input, and keeps it live with a faint noise floor.
+# the default input, and keeps it live with a faint noise floor. Also creates
+# "vspk", the reply sink two-way mode (vbridge-attach) streams back to you.
 #
 # Why the floor: a null sink's monitor is digital silence while nothing plays,
 # and speech-to-text services (Claude Code's /voice uses Deepgram) reject a
@@ -23,6 +24,9 @@ pactl list short sources | grep -qw vmic_mic || \
   pactl load-module module-remap-source master=vmic.monitor source_name=vmic_mic \
     source_properties=device.description=SSH-Mic >/dev/null
 pactl set-default-source vmic_mic >/dev/null || true
+pactl list short sinks   | grep -qw vspk     || \
+  pactl load-module module-null-sink sink_name=vspk \
+    sink_properties=device.description=SSH-Mic-Bridge-Reply >/dev/null
 
 AMP="${VMIC_FLOOR_AMP:-140}"
 

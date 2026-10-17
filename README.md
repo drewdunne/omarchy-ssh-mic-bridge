@@ -70,13 +70,14 @@ talking.
 | Where | What |
 |---|---|
 | SUPER + ALT + V | Start or stop streaming |
-| Bar mic, left click | Start or stop streaming |
+| SUPER + SHIFT + V | Start or stop [talking two-way](#talk-two-way) |
+| Bar mic, left click | Start or stop streaming (or stop talking) |
 | Bar mic, middle click | Choose a microphone |
 | Bar mic, right click | Trigger > SSH Mic Bridge |
-| Trigger > SSH Mic Bridge | Start, Stop, Choose Microphone, Hear What the Server Hears, Set Up Server |
+| Trigger > SSH Mic Bridge | Start, Stop, Talk Two-Way, Stop Talking, Choose Microphone, Hear What the Server Hears, Set Up Server |
 
-The bar mic is dim and crossed out when off, and lit while streaming. Its
-tooltip names the mic and the server.
+The bar mic is dim and crossed out when off, lit while streaming, and a
+headset while you talk two-way. Its tooltip names the mic and the server.
 
 ## Requirements
 
@@ -100,8 +101,9 @@ marked block to `~/.config/hypr/hyprland.lua` (the keybinding) and to
 volume control.
 
 `setup server` checks the server and asks before installing its half:
-`vmic-keepalive` and a user service for it. It then makes the virtual mic the
-server's default input. If the server lacks something, it tells you what to
+`vmic-keepalive` and a user service for it, and `vbridge-attach` for talking
+two-way. It then makes the virtual mic the server's default input, and adds the
+reply sink `vspk` next to it. If the server lacks something, it tells you what to
 install and stops. It never runs sudo.
 
 ## Choose a microphone
@@ -125,6 +127,43 @@ Pick an input that carries only your voice. Some audio interfaces also offer
 mixes (like a GoXLR's "Stream Mix") that add music or game audio. Streaming
 every channel of a multichannel interface can comb-filter your voice.
 
+## Talk two-way
+
+Some agents talk back: Codex's `/voice` is a spoken conversation. Press
+SUPER + SHIFT + V and the bridge carries sound both ways over one SSH
+connection: your mic into the server's virtual mic, and what the agent says
+back into your headphones. The bar mic turns into a headset while you talk. The
+mic-only stream pauses meanwhile, so your voice doesn't arrive twice, and comes
+back when you stop.
+
+```
+your mic  ──parec──▶ ┐                               ┌─▶ vmic ─▶ vmic_mic ─▶ Codex /voice
+                     ssh you@server vbridge-attach ──┤
+your ears ◀─pacat─── ┘                               └── vspk.monitor ◀─ vspk ◀─ Codex speaks
+```
+
+- **Only the agent's voice comes back.** While you talk, Codex's voice
+  (`codex-voice-host`) plays into the reply sink `vspk` instead of the
+  server's default output, which can be the virtual mic itself: it would hear
+  its own replies. Route other programs with `VBRIDGE_APPS`, a regular
+  expression over application names, in the server's environment.
+- **Hooks switch the agent on and off.** If
+  `~/.config/ssh-mic-bridge/hooks/on-attach` exists on the server and is
+  executable, it runs when you start talking, with the mode and a generation
+  number as arguments, and a short tone plays once it's done. `on-detach` runs
+  when you stop. Use them to start and stop `/voice` in the agent's terminal,
+  so it only listens while you're talking to it. If `on-attach` fails, talking
+  stops, and its last line of output says why.
+- **One device at a time.** Starting from a second machine takes over, and
+  the first one is told the voice moved.
+- **Stops by itself** after five quiet minutes (`VBRIDGE_IDLE_MINUTES` on the
+  server; 0 for never).
+- **Use headphones.** On speakers, the agent hears itself through your mic.
+- **Quick.** Over Tailscale it adds about 0.1 s each way.
+
+From a terminal: `ssh-mic-bridge talk [mode]` and `ssh-mic-bridge talk-stop`.
+The mode is only passed to the hooks, to tell them what you want to talk to.
+
 ## Settings
 
 `~/.config/ssh-mic-bridge/config`, written by the commands above and fine to
@@ -133,6 +172,8 @@ edit:
 ```bash
 SSH_MIC_BRIDGE_HOST=you@server   # where the virtual mic lives
 SSH_MIC_BRIDGE_MIC=Yeti          # default, a source name, or part of a mic's name
+SSH_MIC_BRIDGE_TALK_MODE=talk    # what talking two-way asks the server's hooks for
+SSH_MIC_BRIDGE_SPEAKER=          # where replies play; empty for the default output
 ```
 
 To use a different key, edit `~/.config/hypr/bindings.lua`:
@@ -160,6 +201,16 @@ speech-to-text services (Claude Code uses Deepgram) reject a silent source as
 "No speech detected". A real mic always carries some room noise. The floor is
 generated fresh every 50 ms, because repeating one block of noise turns it
 into an audible hum.
+
+**Talking two-way:** `ssh-mic-bridge talk` runs `ssh-mic-bridge-talk.service`
+instead, which pipes `parec` through `ssh you@server vbridge-attach` into a
+local `pacat`. On the server, `vbridge-attach` writes what arrives into `vmic`
+and streams the monitor of the reply sink `vspk` back on the same connection,
+keeping at most a fraction of a second of audio each way. It reports what
+happens as `vbridge: ...` lines on stderr, which the laptop turns into
+notifications. Each attach takes a new generation number under a lock in
+`$XDG_RUNTIME_DIR/ssh-mic-bridge/`; a newer one ends the older, and only the
+newest generation's clean-up runs `on-detach`.
 
 **SSH:** the stream runs in the background with `BatchMode`, so SSH must work
 without a prompt. If your key has a passphrase and the agent is empty (after a
@@ -201,6 +252,7 @@ omarchy plugin remove gg.arkship.ssh-mic-bridge
 
 ```bash
 bash test/setup.sh             # setup and mic matching against a throwaway HOME
+bash test/vbridge.sh           # two-way talk's server half, with stub audio tools
 omarchy plugin validate .
 ```
 

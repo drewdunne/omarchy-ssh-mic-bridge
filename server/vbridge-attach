@@ -1,0 +1,335 @@
+#!/usr/bin/env python3
+"""vbridge-attach: the server half of ssh-mic-bridge's two-way mode ("talk").
+
+    ssh server vbridge-attach [mode]
+
+Reads the laptop's mic from stdin into the "vmic" virtual mic, and writes whatever plays into the
+"vspk" reply sink to stdout, both raw s16le, 48 kHz, mono, so one SSH connection carries both
+ways. vmic-keepalive makes both devices.
+
+Only programs named in VBRIDGE_APPS (a regular expression over PipeWire application names,
+default "codex-voice-host": Codex's voice) are routed while attached: their playback is moved to
+vspk, so their replies reach you instead of looping into the virtual mic (the server's default
+output can be vmic itself), and their recording to vmic_mic.
+
+One device talks at a time. Each attach takes a new generation number; a newer attach ends an
+older one, which exits with 75 and says "taken over". Clean-up only ever acts for its own
+generation, so an old connection can't end a newer one's session.
+
+$XDG_RUNTIME_DIR/ssh-mic-bridge/owner holds "<generation> <pid> <mode>" while one is attached, so
+whatever a hook switched on can be switched off by a watchdog if the attach died without its
+on-detach (killed outright).
+
+Hooks, if they exist and are executable, run as ~/.config/ssh-mic-bridge/hooks/on-attach and
+on-detach with the mode and the generation as arguments (also VBRIDGE_MODE, VBRIDGE_GENERATION).
+on-attach runs before "ready"; a non-zero exit ends the attach (exit 77) with its last line of
+output as the reason. on-detach runs only if no newer attach has happened. Use them to switch an
+app's voice on and off.
+
+Status goes to stderr, one "vbridge: ..." line each, for the laptop to show:
+  vbridge: attached <generation> <mode>
+  vbridge: ready [hook's last line]
+  vbridge: not ready: <reason>    (exit 77)
+  vbridge: taken over             (exit 75)
+  vbridge: idle                   (exit 76: nothing heard either way for VBRIDGE_IDLE_MINUTES)
+  vbridge: ended                  (stdin closed: the laptop stopped)
+
+Env:
+  VBRIDGE_APPS          programs to route (default codex-voice-host)
+  VBRIDGE_MIC, VBRIDGE_MIC_SOURCE, VBRIDGE_REPLY
+                        the devices (default vmic, vmic_mic and vspk), for a second
+                        set beside them, such as a test that mustn't hear the real mic
+  VBRIDGE_IDLE_MINUTES  minutes without speech either way before it ends (default 5; 0 = never)
+  VBRIDGE_TONE          1 (default) plays a short tone when ready; 0 doesn't
+"""
+
+from __future__ import annotations
+
+import array
+import fcntl
+import json
+import math
+import os
+import re
+import signal
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+
+FORMAT = ["--format=s16le", "--rate=48000", "--channels=1", "--raw"]
+RATE = 48000
+CHUNK = 960 * 2  # 20 ms of s16 mono
+LOUD = 10 ** (-42 / 20) * 32768  # RMS over a chunk that counts as someone speaking (-42 dBFS)
+HOOK_WAIT = 30  # seconds on-attach and on-detach may take
+TAKEN_OVER, IDLE, NOT_READY = 75, 76, 77
+
+MODE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
+MIC = os.environ.get("VBRIDGE_MIC") or "vmic"
+MIC_SOURCE = os.environ.get("VBRIDGE_MIC_SOURCE") or "vmic_mic"
+REPLY = os.environ.get("VBRIDGE_REPLY") or "vspk"
+HOME = Path.home()
+HOOKS = HOME / ".config" / "ssh-mic-bridge" / "hooks"
+STATE = Path(os.environ.get("XDG_RUNTIME_DIR") or f"/tmp/vbridge-{os.getuid()}") / "ssh-mic-bridge"
+
+
+def say(line: str) -> None:
+    try:
+        print(f"vbridge: {line}", file=sys.stderr, flush=True)
+    except OSError:
+        pass  # the connection is gone; nobody is left to tell
+
+
+class Lock:
+    """The state folder's lock, held while the generation is read or changed and while hooks run."""
+
+    def __enter__(self):
+        self.f = open(STATE / "lock", "w")
+        fcntl.flock(self.f, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *_):
+        fcntl.flock(self.f, fcntl.LOCK_UN)
+        self.f.close()
+
+
+def current() -> tuple[int, int]:
+    """The generation that owns the bridge now, and its process id (0, 0 when none). The owner file
+    also names the mode, for a watchdog of the app it switches on."""
+    try:
+        gen, pid = (STATE / "owner").read_text().split()[:2]
+        return int(gen), int(pid)
+    except (OSError, ValueError):
+        return 0, 0
+
+
+def next_generation() -> int:
+    try:
+        gen = int((STATE / "generation").read_text()) + 1
+    except (OSError, ValueError):
+        gen = 1
+    (STATE / "generation").write_text(f"{gen}\n")
+    return gen
+
+
+def is_attach(pid: int) -> bool:
+    """Whether pid is still another vbridge-attach, not a process that took its number since."""
+    try:
+        return "vbridge-attach" in Path(f"/proc/{pid}/cmdline").read_bytes().decode(errors="replace")
+    except OSError:
+        return False
+
+
+def hook(name: str, mode: str, gen: int) -> tuple[int, str]:
+    """Runs a hook if there is one: its exit status and its last line of output."""
+    path = HOOKS / name
+    if not (path.is_file() and os.access(path, os.X_OK)):
+        return 0, ""
+    env = {**os.environ, "VBRIDGE_MODE": mode, "VBRIDGE_GENERATION": str(gen)}
+    try:
+        done = subprocess.run([str(path), mode, str(gen)], env=env, stdin=subprocess.DEVNULL,
+                              capture_output=True, text=True, timeout=HOOK_WAIT)
+    except subprocess.TimeoutExpired:
+        return 124, f"{name} took longer than {HOOK_WAIT} s"
+    except OSError as e:
+        return 126, f"{name} couldn't run ({e.strerror})"
+    lines = [line.strip() for line in (done.stdout + "\n" + done.stderr).splitlines() if line.strip()]
+    return done.returncode, (lines[-1] if lines else "")[:200]
+
+
+def tone() -> bytes:
+    """Two short rising notes, quiet: the other side is listening."""
+    out = array.array("h")
+    for freq in (660, 880):
+        n = int(RATE * 0.09)
+        for i in range(n):
+            fade = min(1.0, i / 480, (n - i) / 480)
+            out.append(int(0.12 * 32767 * fade * math.sin(2 * math.pi * freq * i / RATE)))
+        out.extend([0] * int(RATE * 0.03))
+    return out.tobytes()
+
+
+def loud(chunk: bytes) -> bool:
+    a = array.array("h")
+    a.frombytes(chunk[: len(chunk) // 2 * 2])
+    return bool(a) and math.sqrt(sum(v * v for v in a) / len(a)) > LOUD
+
+
+class Bridge:
+    def __init__(self, mode: str, gen: int):
+        self.mode, self.gen = mode, gen
+        self.heard = time.monotonic()  # the last time anyone spoke, either way
+        self.ending = threading.Event()
+        self.why = "ended"
+        self.code = 0
+        self.extra = b""  # audio to mix into the next chunks sent back (the ready tone)
+        self.extra_lock = threading.Lock()
+        self.apps = re.compile(os.environ.get("VBRIDGE_APPS") or "codex-voice-host")
+        self.procs: list[subprocess.Popen] = []
+
+    def end(self, why: str, code: int) -> None:
+        if not self.ending.is_set():
+            self.why, self.code = why, code
+            self.ending.set()
+
+    # --- audio
+
+    def up(self) -> None:
+        """The laptop's mic, from stdin, into vmic."""
+        play = self.spawn(["pacat", "--playback", f"--device={MIC}", *FORMAT, "--latency-msec=60",
+                           "--client-name=vbridge-attach", "--stream-name=talk-in"], stdin=subprocess.PIPE)
+        src = sys.stdin.buffer
+        while not self.ending.is_set():
+            chunk = src.read1(CHUNK) if hasattr(src, "read1") else src.read(CHUNK)
+            if not chunk:
+                self.end("ended", 0)
+                return
+            if loud(chunk):
+                self.heard = time.monotonic()
+            try:
+                play.stdin.write(chunk)
+                play.stdin.flush()
+            except (BrokenPipeError, ValueError):
+                self.end("ended: the virtual mic stopped taking audio", 1)
+                return
+
+    def down(self) -> None:
+        """What plays into vspk, to stdout."""
+        rec = self.spawn(["parec", f"--device={REPLY}.monitor", *FORMAT, "--latency-msec=30",
+                          "--client-name=vbridge-attach", "--stream-name=talk-out"], stdout=subprocess.PIPE)
+        out = sys.stdout.buffer
+        while not self.ending.is_set():
+            chunk = rec.stdout.read(CHUNK)
+            if not chunk:
+                self.end("ended: the reply sink stopped", 1)
+                return
+            if loud(chunk):
+                self.heard = time.monotonic()
+            with self.extra_lock:
+                if self.extra:
+                    chunk, self.extra = mix(chunk, self.extra[: len(chunk)]), self.extra[len(chunk):]
+            try:
+                out.write(chunk)
+                out.flush()
+            except (BrokenPipeError, OSError):
+                self.end("ended", 0)
+                return
+
+    def spawn(self, cmd: list[str], **kw) -> subprocess.Popen:
+        p = subprocess.Popen(cmd, stderr=subprocess.DEVNULL, **kw)
+        self.procs.append(p)
+        return p
+
+    # --- routing
+
+    def route(self) -> None:
+        """Moves the named programs' streams to vspk and vmic_mic now, and whenever new ones start."""
+        self.move_all()
+        try:
+            sub = self.spawn(["pactl", "subscribe"], stdout=subprocess.PIPE, text=True)
+        except OSError:
+            return
+        for line in sub.stdout:
+            if self.ending.is_set():
+                return
+            if "'new'" in line and ("sink-input" in line or "source-output" in line):
+                self.move_all()
+
+    def move_all(self) -> None:
+        for kind, move, target in (("sink-inputs", "move-sink-input", REPLY),
+                                   ("source-outputs", "move-source-output", MIC_SOURCE)):
+            try:
+                found = json.loads(subprocess.run(["pactl", "-f", "json", "list", kind], capture_output=True,
+                                                  text=True, timeout=5).stdout or "[]")
+            except (OSError, ValueError, subprocess.TimeoutExpired):
+                continue
+            for s in found:
+                name = (s.get("properties") or {}).get("application.name") or ""
+                if self.apps.search(name):
+                    subprocess.run(["pactl", move, str(s["index"]), target], capture_output=True, timeout=5)
+
+    # --- watching
+
+    def idle(self) -> None:
+        minutes = float(os.environ.get("VBRIDGE_IDLE_MINUTES") or 5)
+        if minutes <= 0:
+            return
+        while not self.ending.wait(1):
+            if time.monotonic() - self.heard > minutes * 60:
+                self.end("idle", IDLE)
+
+    def run(self) -> None:
+        for work in (self.up, self.down, self.route, self.idle):
+            threading.Thread(target=work, daemon=True).start()
+        # Under the lock, so two attaches' hooks never interleave (a hook that switches voice on
+        # by toggling it would undo the other's), and only while this attach is still the newest.
+        with Lock():
+            if current()[0] != self.gen:
+                self.end("taken over", TAKEN_OVER)
+                code, said = 0, ""
+            else:
+                code, said = hook("on-attach", self.mode, self.gen)
+        if code != 0:
+            self.end(f"not ready: {said or f'on-attach failed ({code})'}", NOT_READY)
+        elif not self.ending.is_set():
+            if os.environ.get("VBRIDGE_TONE", "1") != "0":
+                with self.extra_lock:
+                    self.extra = tone()
+            self.heard = time.monotonic()
+            say(f"ready {said}".rstrip())
+        self.ending.wait()
+
+    def stop(self) -> None:
+        for p in self.procs:
+            try:
+                p.terminate()
+            except OSError:
+                pass
+
+
+def mix(a: bytes, b: bytes) -> bytes:
+    x, y = array.array("h"), array.array("h")
+    x.frombytes(a[: len(a) // 2 * 2])
+    y.frombytes(b[: len(b) // 2 * 2])
+    for i in range(min(len(x), len(y))):
+        x[i] = max(-32768, min(32767, x[i] + y[i]))
+    return x.tobytes()
+
+
+def main() -> int:
+    mode = sys.argv[1] if len(sys.argv) > 1 else "talk"
+    if not MODE.match(mode):
+        say("not ready: the mode must be lowercase letters, digits and dashes")
+        return 2
+    STATE.mkdir(parents=True, exist_ok=True, mode=0o700)
+
+    with Lock():
+        gen = next_generation()
+        _, old = current()
+        (STATE / "owner").write_text(f"{gen} {os.getpid()} {mode}\n")
+    if old and old != os.getpid() and is_attach(old):
+        os.kill(old, signal.SIGUSR1)
+    say(f"attached {gen} {mode}")
+
+    bridge = Bridge(mode, gen)
+    signal.signal(signal.SIGUSR1, lambda *_: bridge.end("taken over", TAKEN_OVER))
+    for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+        signal.signal(sig, lambda *_: bridge.end("ended", 0))
+    try:
+        bridge.run()
+    finally:
+        bridge.stop()
+        with Lock():
+            mine = current()[0] == gen
+            if mine:
+                hook("on-detach", mode, gen)
+                (STATE / "owner").unlink(missing_ok=True)
+        say(bridge.why)
+    return bridge.code
+
+
+if __name__ == "__main__":
+    code = main()
+    sys.stdout.flush()
+    os._exit(code)  # the audio threads may be blocked reading; don't wait for them

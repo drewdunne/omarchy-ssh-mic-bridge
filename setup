@@ -21,7 +21,7 @@ LINK="$HOME/.local/bin/ssh-mic-bridge"
 BEGIN_MARK=">>> $ID >>>"
 END_MARK="<<< $ID <<<"
 ANCHOR='require("default.hypr.omarchy")'
-SERVER_FILES=(".local/bin/vmic-keepalive" ".config/systemd/user/vmic-keepalive.service")
+SERVER_FILES=(".local/bin/vmic-keepalive" ".local/bin/vbridge-attach" ".config/systemd/user/vmic-keepalive.service")
 YES=0
 REMOVE=0
 HOST_ARG=""
@@ -64,6 +64,16 @@ backup() {
 # has_block FILE COMMENT-PREFIX
 has_block() {
   [[ -f $1 ]] && grep -qF -- "$2 $BEGIN_MARK" "$1"
+}
+
+# block_text FILE COMMENT-PREFIX: the block as it is in FILE, markers included.
+block_text() {
+  BEGIN_LINE="$2 $BEGIN_MARK" END_LINE="$2 $END_MARK" awk '
+    { line = $0; sub(/^[ \t]+/, "", line) }
+    line == ENVIRON["BEGIN_LINE"] { inside = 1 }
+    inside { print }
+    inside && line == ENVIRON["END_LINE"] { exit }
+  ' "$1"
 }
 
 # insert_block FILE ANCHOR-REGEX BLOCK: put BLOCK after the first line
@@ -119,11 +129,13 @@ LUA
 menu_block() {
   local sb="\$HOME/.config/omarchy/plugins/$ID/bin/ssh-mic-bridge"
   local setup="\$HOME/.config/omarchy/plugins/$ID/setup"
-  local mic mic_off mic_settings headphones server
+  local mic mic_off mic_settings headphones headset headset_off server
   mic=$(printf '\U000F036C')
   mic_off=$(printf '\U000F036D')
   mic_settings=$(printf '\U000F036F')
   headphones=$(printf '\U000F02CB')
+  headset=$(printf '\U000F02CE')
+  headset_off=$(printf '\U000F02CF')
   server=$(printf '\U000F048B')
   cat <<JSONC
   // $BEGIN_MARK
@@ -131,6 +143,8 @@ menu_block() {
   "trigger.ssh-mic-bridge": {"icon":"$mic","label":"SSH Mic Bridge","aliases":["ssh-mic-bridge","mic-bridge"],"description":"Stream your mic to a server over SSH"},
   "trigger.ssh-mic-bridge.start": {"icon":"$mic","label":"Start","when":"! $sb running","action":"$sb start"},
   "trigger.ssh-mic-bridge.stop": {"icon":"$mic_off","label":"Stop","when":"$sb running","action":"$sb stop"},
+  "trigger.ssh-mic-bridge.talk": {"icon":"$headset","label":"Talk Two-Way","when":"! $sb talking","action":"$sb talk"},
+  "trigger.ssh-mic-bridge.talk-stop": {"icon":"$headset_off","label":"Stop Talking","when":"$sb talking","action":"$sb talk-stop"},
   "trigger.ssh-mic-bridge.pick": {"icon":"$mic_settings","label":"Choose Microphone","action":"$sb pick"},
   "trigger.ssh-mic-bridge.test": {"icon":"$headphones","label":"Hear What the Server Hears","action":"omarchy-launch-floating-terminal-with-presentation \\"$sb test\\""},
   "trigger.ssh-mic-bridge.server": {"icon":"$server","label":"Set Up Server","action":"omarchy-launch-floating-terminal-with-presentation \\"$setup server\\""},
@@ -209,7 +223,7 @@ install() {
   check_tools
   [[ -f $HYPR_CONFIG ]] || { echo "setup: $HYPR_CONFIG not found" >&2; exit 1; }
 
-  echo "This adds a loader block to $HYPR_CONFIG (SUPER + ALT + V),"
+  echo "This adds a loader block to $HYPR_CONFIG (SUPER + ALT + V, SUPER + SHIFT + V),"
   echo "a Trigger > SSH Mic Bridge block to $MENU_CONFIG,"
   echo "a link at $LINK, and the bar widget."
   confirm "Continue?" || exit 1
@@ -222,8 +236,14 @@ install() {
     insert_block "$HYPR_CONFIG" "^require\\(\"default\\.hypr\\.omarchy\"\\)" "$(hypr_block)"
   fi
 
-  if has_block "$MENU_CONFIG" "//"; then
+  if has_block "$MENU_CONFIG" "//" && [[ $(block_text "$MENU_CONFIG" "//") == "$(menu_block)" ]]; then
     echo "The menu already has SSH Mic Bridge."
+  elif has_block "$MENU_CONFIG" "//"; then
+    # An older version's block: replaced in place, at the top of the file.
+    backup "$MENU_CONFIG"
+    remove_block "$MENU_CONFIG" "//"
+    insert_block "$MENU_CONFIG" '^[[:space:]]*[{][[:space:]]*$' "$(menu_block)"
+    echo "Updated the menu's SSH Mic Bridge entries."
   else
     if [[ -f $MENU_CONFIG ]]; then
       backup "$MENU_CONFIG"
@@ -262,6 +282,7 @@ install() {
 uninstall() {
   confirm "Stop streaming and remove SSH Mic Bridge's keybinding, menu, command and bar widget?" || exit 1
 
+  if "$CTL" talking; then "$CTL" talk-stop || true; fi
   if "$CTL" running; then "$CTL" stop || true; fi
 
   if has_block "$HYPR_CONFIG" "--"; then
@@ -300,11 +321,12 @@ if ls /etc/alsa/conf.d /usr/share/alsa/alsa.conf.d 2>/dev/null | grep -qE '^99-(
 else
   echo "alsa=no"
 fi
-for f in .local/bin/vmic-keepalive .config/systemd/user/vmic-keepalive.service; do
+for f in .local/bin/vmic-keepalive .local/bin/vbridge-attach .config/systemd/user/vmic-keepalive.service; do
   if [ -f "$HOME/$f" ]; then echo "file=$(md5sum < "$HOME/$f" | cut -d' ' -f1) $f"; else echo "file=none $f"; fi
 done
 echo "service=$(systemctl --user is-active vmic-keepalive 2>/dev/null)"
 echo "monitor=$(pactl list short sources 2>/dev/null | awk '$2 == "vmic.monitor" { print $NF }')"
+pactl list short sinks 2>/dev/null | awk '$2 == "vspk" { found = 1 } END { exit !found }' && echo "reply=yes" || echo "reply=no"
 echo "default=$(pactl get-default-source 2>/dev/null)"
 echo "linger=$(loginctl show-user "$USER" -p Linger --value 2>/dev/null)"
 SH
@@ -325,13 +347,19 @@ server_files_match() {
 server_live() {
   [[ $(report_value service "$1") == active &&
     $(report_value monitor "$1") == RUNNING &&
-    $(report_value default "$1") == vmic_mic ]]
+    $(report_value default "$1") == vmic_mic &&
+    $(report_value reply "$1") == yes ]]
 }
 
 print_server_state() {
   echo "  vmic-keepalive:  $(report_value service "$1")"
   echo "  vmic.monitor:    $(report_value monitor "$1")"
   echo "  default input:   $(report_value default "$1")"
+  if [[ $(report_value reply "$1") == yes ]]; then
+    echo "  reply sink:      vspk (talking two-way works)"
+  else
+    echo "  reply sink:      missing (setup server adds it, for talking two-way)"
+  fi
   if [[ $(report_value alsa "$1") == yes ]]; then
     echo "  ALSA default:    the sound server (Claude Code can hear vmic_mic)"
   else
@@ -370,9 +398,10 @@ HINT
   fi
 
   echo
-  echo "This installs vmic-keepalive on $host (in ~/.local/bin and"
-  echo "~/.config/systemd/user), starts it, and makes its virtual mic"
-  echo "(vmic_mic) the default input there. It replaces any existing copy."
+  echo "This installs vmic-keepalive and vbridge-attach on $host (in"
+  echo "~/.local/bin and ~/.config/systemd/user), starts the keep-alive, and"
+  echo "makes its virtual mic (vmic_mic) the default input there. It adds a"
+  echo "reply sink (vspk) for talking two-way. It replaces any existing copy."
   confirm "Continue?" || exit 1
 
   for f in "${SERVER_FILES[@]}"; do
@@ -381,7 +410,7 @@ HINT
     ssh "$host" "mkdir -p \"\$HOME/${f%/*}\" && cat > \"\$HOME/$f.new\" && mv \"\$HOME/$f.new\" \"\$HOME/$f\"" <"$PLUGIN_DIR/server/${f##*/}"
   done
   ssh "$host" bash -s <<'SH'
-chmod +x ~/.local/bin/vmic-keepalive
+chmod +x ~/.local/bin/vmic-keepalive ~/.local/bin/vbridge-attach
 systemctl --user daemon-reload
 systemctl --user enable vmic-keepalive.service >/dev/null 2>&1
 systemctl --user restart vmic-keepalive.service
@@ -413,9 +442,9 @@ server_remove() {
   "$CTL" running && "$CTL" stop || true
   ssh "$host" bash -s <<'SH'
 systemctl --user disable --now vmic-keepalive.service 2>/dev/null || true
-rm -f ~/.local/bin/vmic-keepalive ~/.config/systemd/user/vmic-keepalive.service
+rm -f ~/.local/bin/vmic-keepalive ~/.local/bin/vbridge-attach ~/.config/systemd/user/vmic-keepalive.service
 systemctl --user daemon-reload
-for id in $(pactl list short modules 2>/dev/null | awk '/source_name=vmic_mic|sink_name=vmic( |$)/ { print $1 }' | sort -rn); do
+for id in $(pactl list short modules 2>/dev/null | awk '/source_name=vmic_mic|sink_name=(vmic|vspk)( |$)/ { print $1 }' | sort -rn); do
   pactl unload-module "$id" 2>/dev/null || true
 done
 echo "Removed. The default input there is now $(pactl get-default-source 2>/dev/null)."

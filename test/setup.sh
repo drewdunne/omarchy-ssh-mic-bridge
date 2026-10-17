@@ -89,7 +89,8 @@ raw = re.sub(r"(?m)^\s*//[^\n]*(\n|$)", "", raw)
 raw = re.sub(r",(\s*[}\]])", r"\1", raw)
 items = json.loads(raw)
 want = {"trigger.ssh-mic-bridge", "trigger.ssh-mic-bridge.start", "trigger.ssh-mic-bridge.stop",
-        "trigger.ssh-mic-bridge.pick", "trigger.ssh-mic-bridge.test", "trigger.ssh-mic-bridge.server"}
+        "trigger.ssh-mic-bridge.pick", "trigger.ssh-mic-bridge.test", "trigger.ssh-mic-bridge.server",
+        "trigger.ssh-mic-bridge.talk", "trigger.ssh-mic-bridge.talk-stop"}
 sys.exit(0 if want <= set(items) else 1)
 PY
 }
@@ -117,6 +118,17 @@ cp "$MENU" "$WORK/once.jsonc"
 bash "$PLUGIN/setup" install --yes >/dev/null
 check "install twice changes nothing" cmp -s "$WORK/once.lua" "$HYPR"
 check "menu twice changes nothing" cmp -s "$WORK/once.jsonc" "$MENU"
+
+# An older version's menu block (without the talk entries) is replaced, once.
+python3 - "$MENU" <<'PY2'
+import sys
+p = sys.argv[1]; s = open(p).read()
+s = "".join(l for l in s.splitlines(keepends=True) if "trigger.ssh-mic-bridge.talk" not in l)
+open(p, "w").write(s)
+PY2
+bash "$PLUGIN/setup" install --yes >/dev/null
+check "an older menu block is updated" menu_parses
+check "and ends up as a fresh install's" cmp -s "$WORK/once.jsonc" "$MENU"
 
 # ---------------------------------------------------------------- uninstall
 bash "$PLUGIN/setup" uninstall --yes >/dev/null

@@ -5,8 +5,9 @@ import qs.Commons
 import qs.Ui
 
 // SSH Mic Bridge in the bar. The mic lights up while it streams to the
-// server. Left click starts or stops it, middle click picks a microphone,
-// right click opens Trigger > SSH Mic Bridge.
+// server, and turns into a headset while you talk two-way. Left click starts
+// or stops it (or stops talking), middle click picks a microphone, right click
+// opens Trigger > SSH Mic Bridge.
 BarWidget {
   id: root
   moduleName: "gg.arkship.ssh-mic-bridge"
@@ -16,6 +17,9 @@ BarWidget {
 
   property bool running: false
   property bool connecting: false
+  property bool talking: false
+  property bool talkReady: false
+  property string mode: ""
   property string mic: ""
   property string host: ""
 
@@ -32,6 +36,9 @@ BarWidget {
     }
     root.running = data.running === true
     root.connecting = data.connecting === true
+    root.talking = data.talking === true
+    root.talkReady = data.talk_ready === true
+    root.mode = String(data.mode || "")
     root.mic = String(data.mic || "")
     root.host = String(data.host || "")
   }
@@ -75,18 +82,21 @@ BarWidget {
     id: button
     anchors.fill: parent
     bar: root.bar
-    text: String.fromCodePoint(root.running ? 0xF036C : 0xF036D)
-    active: root.running
-    dimmed: !root.running
-    tooltipText: (root.running
+    text: String.fromCodePoint(root.talking ? 0xF02CE : (root.running ? 0xF036C : 0xF036D))
+    active: root.running || root.talking
+    dimmed: !(root.running || root.talking)
+    tooltipText: (root.talking
+        ? (root.talkReady ? "Talking two-way with " + root.host + " (" + root.mode + ")"
+                          : "Connecting to " + root.host + " (" + root.mode + ")")
+        : root.running
         ? (root.connecting ? "Connecting to " + root.host
                            : "Streaming " + root.mic + " to " + root.host)
         : "Mic bridge off: " + root.mic + " → " + root.host)
-      + "\nClick to " + (root.running ? "stop" : "start")
+      + "\nClick to " + (root.talking ? "stop talking" : root.running ? "stop" : "start")
       + " · Middle-click to pick a mic · Right-click for more"
 
     onPressed: function(mouseButton) {
-      if (mouseButton === Qt.LeftButton) root.run("toggle")
+      if (mouseButton === Qt.LeftButton) root.run(root.talking ? "talk-stop" : "toggle")
       else if (mouseButton === Qt.MiddleButton) root.run("pick")
       else if (mouseButton === Qt.RightButton && root.bar)
         root.bar.run("omarchy menu summon ssh-mic-bridge")
