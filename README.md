@@ -2,6 +2,12 @@
 
 ### Talk to CLI Agents on your server. Over SSH. Finally.
 
+> [!TIP]
+> **New: Codex CLI's voice conversations, over SSH.** Codex's new `/voice` talks
+> back. Press SUPER + SHIFT + V, run `/voice` in Codex on your server, and just
+> talk: your voice goes up, and Codex answers out loud in your headphones or
+> speakers. See [Talk two-way](#talk-two-way).
+
 > **A local microphone:** voice dictation does not work in cloud sessions or
 > SSH sessions.
 >
@@ -33,6 +39,9 @@ the default mic hears you.
 
 - **One key and you're live.** SUPER + ALT + V, or a click on the mic in your
   bar. The icon lights up while you're streaming, so you always know.
+- **Talk with Codex, not just to it.** SUPER + SHIFT + V carries Codex CLI's
+  voice conversations both ways: you speak, and Codex answers out loud on your
+  machine, even through laptop speakers.
 - **Any mic you own.** A USB mic, a headset, or an audio interface. Pick it from
   a menu, or name it: `ssh-mic-bridge mic "Yeti"`.
 - **Just SSH.** It rides the SSH access you already have: no ports to open, no
@@ -56,6 +65,9 @@ omarchy plugin add https://github.com/drewdunne/omarchy-ssh-mic-bridge.git --yes
 
 Then: SUPER + ALT + V, `ssh you@server`, `claude`, `/voice tap`, and start
 talking.
+
+Or have a conversation with Codex: SUPER + SHIFT + V, `ssh you@server`,
+`codex`, `/voice`, and talk. Codex answers out loud.
 
 ## Works with
 
@@ -88,9 +100,9 @@ headset while you talk two-way. Its tooltip names the mic and the server.
 - **Server:** Linux with a systemd user session, `python3`, and PipeWire with
   `pipewire-pulse` and `pipewire-alsa`. Plain PulseAudio with its ALSA plugin
   works too. No GUI, no sound card and no open ports are needed. The ALSA part
-  matters because Claude Code records through ALSA, and `pipewire-alsa` points
-  ALSA at the virtual mic. `setup server` checks for all of this and tells you
-  what to install.
+  matters because Claude Code and Codex's voice record through ALSA, and
+  `pipewire-alsa` points ALSA at the virtual mic. `setup server` checks for all
+  of this and tells you what to install.
 
 ## What setup does
 
@@ -129,12 +141,13 @@ every channel of a multichannel interface can comb-filter your voice.
 
 ## Talk two-way
 
-Some agents talk back: Codex's `/voice` is a spoken conversation. Press
-SUPER + SHIFT + V and the bridge carries sound both ways over one SSH
-connection: your mic into the server's virtual mic, and what the agent says
-back into your headphones. The bar mic turns into a headset while you talk. The
-mic-only stream pauses meanwhile, so your voice doesn't arrive twice, and comes
-back when you stop.
+Some agents talk back. Codex CLI's new voice conversations do: run `/voice` in
+Codex, and it listens, answers out loud, and gets on with what you asked. Press
+SUPER + SHIFT + V, then run `/voice` in Codex on your server, and the bridge
+carries sound both ways over one SSH connection: your mic into the server's
+virtual mic, and what the agent says back into your headphones or speakers.
+The bar mic turns into a headset while you talk. The mic-only stream pauses
+meanwhile, so your voice doesn't arrive twice, and comes back when you stop.
 
 ```
 your mic  ──parec──▶ ┐                               ┌─▶ vmic ─▶ vmic_mic ─▶ Codex /voice

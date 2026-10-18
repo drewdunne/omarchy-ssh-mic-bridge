@@ -2,9 +2,9 @@
   "schemaVersion": 1,
   "id": "gg.arkship.ssh-mic-bridge",
   "name": "SSH Mic Bridge",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "author": "Andrew Dunne",
-  "description": "Stream your microphone over SSH into a virtual mic on a server, so Claude Code's /voice (or any app there) hears you",
+  "description": "Stream your microphone over SSH into a virtual mic on a server, so Claude Code's /voice (or any app there) hears you, and talk two-way with Codex CLI's /voice conversations",
   "kinds": [
     "bar-widget"
   ],
