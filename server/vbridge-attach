@@ -173,7 +173,8 @@ class Reserve:
     back by RESERVE_MS, takes those holes out, and makes the time up in the next pause instead,
     holding a pause longer while the reserve is short and shortening one while it's long. Audio goes
     out at the rate it comes in, byte for byte; a hole longer than the reserve still leaves a cut,
-    shorter by the reserve. Measured in ark-sdlc intent 0113."""
+    shorter by the reserve. Over recorded replies, 80 ms took out about 93% of the cuts and added
+    about 0.06 s."""
 
     def __init__(self, ms: float):
         self.target = int(RATE * ms / 1000)
