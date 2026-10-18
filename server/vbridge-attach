@@ -41,6 +41,9 @@ Env:
                         set beside them, such as a test that mustn't hear the real mic
   VBRIDGE_IDLE_MINUTES  minutes without speech either way before it ends (default 5; 0 = never)
   VBRIDGE_TONE          1 (default) plays a short tone when ready; 0 doesn't
+  VBRIDGE_REPLY_RESERVE_MS
+                        how far the reply is held back so the holes in Codex's voice can be
+                        taken out (default 80; 0 = sent as it plays, as before). See Reserve.
 """
 
 from __future__ import annotations
@@ -62,6 +65,10 @@ FORMAT = ["--format=s16le", "--rate=48000", "--channels=1", "--raw"]
 RATE = 48000
 CHUNK = 960 * 2  # 20 ms of s16 mono
 LOUD = 10 ** (-42 / 20) * 32768  # RMS over a chunk that counts as someone speaking (-42 dBFS)
+BLOCK = 480  # 10 ms of samples
+HOLE_MIN, HOLE_MAX = RATE // 200, RATE // 5  # a run of exact silence that can be a hole: 5 to 200 ms
+QUIET = int(10 ** (-40 / 20) * 32768)  # peak over 10 ms below which the reply is in a pause
+ZEROS = re.compile(rb"\x00+")
 HOOK_WAIT = 30  # seconds on-attach and on-detach may take
 TAKEN_OVER, IDLE, NOT_READY = 75, 76, 77
 
@@ -69,6 +76,7 @@ MODE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
 MIC = os.environ.get("VBRIDGE_MIC") or "vmic"
 MIC_SOURCE = os.environ.get("VBRIDGE_MIC_SOURCE") or "vmic_mic"
 REPLY = os.environ.get("VBRIDGE_REPLY") or "vspk"
+RESERVE_MS = float(os.environ.get("VBRIDGE_REPLY_RESERVE_MS") or 80)
 HOME = Path.home()
 HOOKS = HOME / ".config" / "ssh-mic-bridge" / "hooks"
 STATE = Path(os.environ.get("XDG_RUNTIME_DIR") or f"/tmp/vbridge-{os.getuid()}") / "ssh-mic-bridge"
@@ -156,6 +164,93 @@ def loud(chunk: bytes) -> bool:
     return bool(a) and math.sqrt(sum(v * v for v in a) / len(a)) > LOUD
 
 
+class Reserve:
+    """A small reserve on the way back to the laptop, for the holes in Codex's voice.
+
+    When the voice server's audio runs late (it sends a little slower than real time at times),
+    Codex's voice helper plays whole 10 ms frames of exact silence in the middle of its speech, then
+    the late audio after them: short cuts, several a second at worst. The reserve holds the reply
+    back by RESERVE_MS, takes those holes out, and makes the time up in the next pause instead,
+    holding a pause longer while the reserve is short and shortening one while it's long. Audio goes
+    out at the rate it comes in, byte for byte; a hole longer than the reserve still leaves a cut,
+    shorter by the reserve. Measured in ark-sdlc intent 0113."""
+
+    def __init__(self, ms: float):
+        self.target = int(RATE * ms / 1000)
+        self.ready = array.array("h")  # audio waiting to go out
+        self.zeros = 0  # exact silence just in, not yet known to be a hole or a pause
+        self.silent = True  # in a long silence (or before any sound), whose zeros go straight out
+        self.filled = False  # the reserve has filled once, at the start
+        self.carry = b""  # half a sample, from a read that ended mid-sample
+
+    def take(self, chunk: bytes) -> bytes:
+        """The chunk in, and as much audio out (an odd byte waits for the next chunk)."""
+        chunk = self.carry + chunk
+        n = len(chunk) // 2
+        self.carry = chunk[n * 2 :]
+        chunk = chunk[: n * 2]
+        a = array.array("h")
+        a.frombytes(chunk)
+        # One byte a sample, zero only where the sample is: its runs are the exact silences.
+        mask = int.from_bytes(chunk[0::2], "little") | int.from_bytes(chunk[1::2], "little")
+        at = 0
+        for run in ZEROS.finditer(mask.to_bytes(n, "little")):
+            self.sound(a[at : run.start()])
+            self.silence(run.end() - run.start())
+            at = run.end()
+        self.sound(a[at:])
+        return self.give(n).tobytes()
+
+    def sound(self, samples: array.array) -> None:
+        if not samples:
+            return
+        if self.zeros:
+            if self.zeros < HOLE_MIN:  # too short for a hole: part of the sound
+                self.ready.extend(array.array("h", bytes(self.zeros * 2)))
+            # otherwise it was a hole: dropped
+            self.zeros = 0
+        self.silent = False
+        self.ready.extend(samples)
+
+    def silence(self, count: int) -> None:
+        if self.silent:
+            self.ready.extend(array.array("h", bytes(count * 2)))
+            return
+        self.zeros += count
+        if self.zeros > HOLE_MAX:  # too long for a hole: a real silence
+            self.ready.extend(array.array("h", bytes(self.zeros * 2)))
+            self.zeros = 0
+            self.silent = True
+
+    def give(self, n: int) -> array.array:
+        out = array.array("h")
+        while len(out) < n:
+            k = min(BLOCK, n - len(out))
+            if not self.filled:  # the start: fill the reserve before anything goes out
+                if len(self.ready) < self.target:
+                    out.extend(array.array("h", bytes(k * 2)))
+                    continue
+                self.filled = True
+            head = self.ready[:k]
+            pause = not head or (max(head) < QUIET and min(head) > -QUIET)
+            if pause and len(self.ready) < self.target:
+                out.extend(array.array("h", bytes(k * 2)))  # hold the pause while the reserve refills
+                continue
+            if pause and len(self.ready) > self.target + BLOCK:
+                # Shorten the pause while the reserve is long: exact silence (a long one, part of
+                # which went out already while it was still being told from a hole) all at once,
+                # anything else a little at a time.
+                raw = self.ready.tobytes()
+                silent = (len(raw) - len(raw.lstrip(b"\x00"))) // 2  # samples of exact silence first
+                del self.ready[: min(silent, len(self.ready) - self.target) if silent >= k else k // 2]
+            head = self.ready[:k]
+            del self.ready[:k]
+            out.extend(head)
+            if len(head) < k:  # ran dry mid-speech: a cut the reserve couldn't cover
+                out.extend(array.array("h", bytes((k - len(head)) * 2)))
+        return out
+
+
 class Bridge:
     def __init__(self, mode: str, gen: int):
         self.mode, self.gen = mode, gen
@@ -195,7 +290,16 @@ class Bridge:
                 return
 
     def down(self) -> None:
-        """What plays into vspk, to stdout."""
+        """What plays into vspk, to stdout, through the reserve."""
+        reserve = Reserve(RESERVE_MS) if RESERVE_MS > 0 else None
+        if reserve:
+            # A stream into the reply sink keeps it running between replies, so its recording
+            # keeps time and the reserve's last few hundredths of a reply go out after it. The
+            # stream needs no data. Its stdin is a pipe only this process holds, so it ends with
+            # this process however that ends, and it never touches stdout (the laptop's audio).
+            self.spawn(["pacat", "--playback", f"--device={REPLY}", *FORMAT, "--latency-msec=100",
+                        "--client-name=vbridge-attach", "--stream-name=talk-awake"],
+                       stdin=subprocess.PIPE, stdout=subprocess.DEVNULL)
         rec = self.spawn(["parec", f"--device={REPLY}.monitor", *FORMAT, "--latency-msec=30",
                           "--client-name=vbridge-attach", "--stream-name=talk-out"], stdout=subprocess.PIPE)
         out = sys.stdout.buffer
@@ -206,6 +310,8 @@ class Bridge:
                 return
             if loud(chunk):
                 self.heard = time.monotonic()
+            if reserve:
+                chunk = reserve.take(chunk)
             with self.extra_lock:
                 if self.extra:
                     chunk, self.extra = mix(chunk, self.extra[: len(chunk)]), self.extra[len(chunk):]

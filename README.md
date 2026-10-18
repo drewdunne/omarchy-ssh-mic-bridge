@@ -164,7 +164,14 @@ your ears ◀─pacat─── ┘                               └── vspk.
   PipeWire's echo canceller between your mic and your output, which takes what
   it plays out of what the mic hears, and removes it when you stop
   (`SSH_MIC_BRIDGE_ECHO_CANCEL=auto`, the default; `on` or `off` to choose).
-- **Quick.** Over Tailscale it adds about 0.1 s each way.
+- **No holes in the agent's voice.** When Codex's voice server sends its audio
+  a little slower than it plays, Codex fills the gaps with short runs of
+  silence, mid-word. The server holds replies back by up to 0.08 s, takes those
+  holes out, and makes the time up in the next pause
+  (`VBRIDGE_REPLY_RESERVE_MS` on the server, 80 by default; 0 sends replies as
+  they play).
+- **Quick.** Over Tailscale it adds about 0.1 s each way, and replies up to
+  0.08 s more for the holes.
 
 From a terminal: `ssh-mic-bridge talk [mode]` and `ssh-mic-bridge talk-stop`.
 The mode is only passed to the hooks, to tell them what you want to talk to.
@@ -212,7 +219,11 @@ into an audible hum.
 instead, which pipes `parec` through `ssh you@server vbridge-attach` into a
 local `pacat`. On the server, `vbridge-attach` writes what arrives into `vmic`
 and streams the monitor of the reply sink `vspk` back on the same connection,
-keeping at most a fraction of a second of audio each way. It reports what
+keeping at most a fraction of a second of audio each way. Replies pass through a
+small reserve that drops runs of exact silence (5 to 200 ms) between sounds and
+lengthens or shortens pauses to keep its delay near `VBRIDGE_REPLY_RESERVE_MS`;
+meanwhile a silent stream keeps `vspk` running, so the monitor keeps time and a
+reply's last moments go out after it. It reports what
 happens as `vbridge: ...` lines on stderr, which the laptop turns into
 notifications. Each attach takes a new generation number under a lock in
 `$XDG_RUNTIME_DIR/ssh-mic-bridge/`; a newer one ends the older, and only the
